@@ -40,10 +40,12 @@ cargo build --release
 --add <hip>              启动时添加工程
 --run                    启动后立即开始队列
 --drop-test <path>       自检原生拖放通道
---snapshot <file.bmp>    生成界面快照
+--snapshot <file.bmp>    生成界面快照（可配 --snapshot-delay <毫秒>）
 --light                  强制亮色主题
---remove-index <n>       删除指定工程
 --probe-version <hip>    探测 hip 的制作版本
+--set-font <字体> <字号> 调试：切换字体并落库
+--set-version <下标>     调试：切换当前工程的 Houdini 版本
+--font-panel             调试：直接打开字体面板
 ```
 
 ## 环境
