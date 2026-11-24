@@ -1,0 +1,1062 @@
+import { ComboBox, ScrollView, Palette } from "std-widgets.slint";
+
+// 导出给 Rust：暗色下标准控件的配色只能从宿主语言设置
+export { Palette }
+
+export struct Shot { name: string, sub: string, meta: string, tone: int }
+export struct OutNode { checked: bool, path: string, ntype: string, category: string, output: string, range: string, status: string, tone: int }
+export struct QTask { nid: string, title: string, shot: string, category: string, range: string, status: string, progress: int, frames: string, tone: int }
+
+// ─────────────────────────────────────────────────────────────
+// 主题 token：暗房仪器风。深石墨底 + 暖灰字 + 单一琥珀强调。
+// 不用纯黑/纯白，暗色下也不上高饱和霓虹。
+// ─────────────────────────────────────────────────────────────
+export global Theme {
+    in-out property <bool> dark: true;
+
+    // 底
+    out property <color> canvas: dark ? #101216 : #f3f2ef;
+    out property <color> panel: dark ? #171a1f : #ffffff;
+    out property <color> well: dark ? #1d2127 : #f7f6f3;
+    out property <color> hover: dark ? #232830 : #efede8;
+    out property <color> row-alt: dark ? #1a1d23 : #faf9f6;
+    out property <color> border: dark ? #262b33 : #e4e2dc;
+    out property <color> border-2: dark ? #363c46 : #cecbc3;
+
+    // 字（次要文字再提一档亮度，小字号下也读得清）
+    out property <color> text: dark ? #f0ede6 : #14130f;
+    out property <color> text-2: dark ? #bdb8ae : #4b4842;
+    out property <color> text-3: dark ? #969188 : #68645c;
+
+    // 强调（琥珀）
+    out property <color> accent: dark ? #dfa147 : #a9690f;
+    out property <color> accent-hi: dark ? #ecb264 : #92590a;
+    out property <color> accent-fg: dark ? #171008 : #ffffff;
+    out property <color> accent-soft: dark ? #2a2318 : #f7ecda;
+    out property <color> accent-line: dark ? #4d3d26 : #e2cba6;
+
+    // 状态
+    out property <color> ok: dark ? #77b97f : #3f7d3c;
+    out property <color> ok-soft: dark ? #18241b : #e9f3e7;
+    out property <color> ok-line: dark ? #2f4634 : #c4ddc1;
+
+    out property <color> run: dark ? #6aa8e0 : #1e6ea8;
+    out property <color> run-soft: dark ? #16222e : #e5eff9;
+    out property <color> run-line: dark ? #2b4258 : #bcd6ea;
+
+    out property <color> err: dark ? #e17d70 : #a83a30;
+    out property <color> err-soft: dark ? #2a1a18 : #fbe9e6;
+    out property <color> err-line: dark ? #4a2b28 : #eec6c0;
+
+    out property <color> teal: dark ? #5cb3a2 : #0f6e56;
+    out property <color> teal-soft: dark ? #152523 : #e2f4ee;
+    out property <color> teal-line: dark ? #2a4642 : #b8ddd2;
+
+    out property <color> mute: dark ? #9a968d : #5f5e59;
+    out property <color> mute-soft: dark ? #21252b : #f1efe9;
+    out property <color> mute-line: dark ? #333944 : #ddd9d0;
+}
+
+// tone: 0 灰 / 1 蓝(运行) / 2 绿(成功) / 3 红(失败) / 4 琥珀 / 5 青
+global Tone {
+    public pure function fg(t: int) -> color {
+        return t == 1 ? Theme.run : t == 2 ? Theme.ok : t == 3 ? Theme.err : t == 4 ? Theme.accent : t == 5 ? Theme.teal : Theme.mute;
+    }
+    public pure function bg(t: int) -> color {
+        return t == 1 ? Theme.run-soft : t == 2 ? Theme.ok-soft : t == 3 ? Theme.err-soft : t == 4 ? Theme.accent-soft : t == 5 ? Theme.teal-soft : Theme.mute-soft;
+    }
+    public pure function line(t: int) -> color {
+        return t == 1 ? Theme.run-line : t == 2 ? Theme.ok-line : t == 3 ? Theme.err-line : t == 4 ? Theme.accent-line : t == 5 ? Theme.teal-line : Theme.mute-line;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 统一字体配置：Rust 侧从 meta 表读入，所有字号经 size() 缩放
+// ─────────────────────────────────────────────────────────────
+export global Fonts {
+    /// 正文字体；空串 = 系统默认
+    in-out property <string> body: "";
+    /// 等宽字体（路径、帧号、日志）
+    in-out property <string> mono: "Consolas";
+    /// 字号倍率
+    in-out property <float> scale: 1.15;
+
+    public pure function size(base: length) -> length {
+        return base * scale;
+    }
+}
+
+// 等宽小标签，用于面板头的拉丁标记（仪器铭牌感）
+component Tag inherits Text {
+    in-out property <color> tint: Theme.text-3;
+    font-family: Fonts.mono;
+    font-size: Fonts.size(10px);
+    letter-spacing: 0.9px;
+    color: root.tint;
+    vertical-alignment: center;
+}
+
+component Badge inherits Rectangle {
+    in property <string> label;
+    in property <int> tone: 0;
+    in property <length> w: 44px;
+    width: w;
+    height: 17px;
+    border-radius: 4px;
+    background: Tone.bg(tone);
+    border-width: 1px;
+    border-color: Tone.line(tone);
+    Text {
+        text: root.label;
+        color: Tone.fg(root.tone);
+        font-size: Fonts.size(10.5px);
+        font-weight: 500;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// 可点的小标签：hover 有反馈，激活态用琥珀
+component Chip inherits Rectangle {
+    in property <string> label;
+    in-out property <bool> active: false;
+    in property <length> w: 46px;
+    callback clicked();
+    width: w;
+    height: 20px;
+    border-radius: 5px;
+    background: active ? Theme.accent-soft : (ta.has-hover ? Theme.hover : transparent);
+    border-width: 1px;
+    border-color: active ? Theme.accent-line : (ta.has-hover ? Theme.border-2 : Theme.border-2);
+    Text {
+        text: root.label;
+        font-size: Fonts.size(11px);
+        color: root.active ? Theme.accent : Theme.text-2;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 按钮：1 主(琥珀实心) / 2 次(描边) / 3 危险(红描边)
+component TBtn inherits Rectangle {
+    in property <string> label;
+    in property <int> kind: 2;
+    in property <length> w: 58px;
+    in property <length> h: 25px;
+    callback clicked();
+    width: w;
+    height: h;
+    border-radius: 6px;
+    background: kind == 1 ? (ta.has-hover ? Theme.accent-hi : Theme.accent)
+              : kind == 3 ? (ta.has-hover ? Theme.err-soft : transparent)
+              : (ta.has-hover ? Theme.hover : Theme.well);
+    border-width: 1px;
+    border-color: kind == 1 ? transparent : (kind == 3 ? Theme.err-line : Theme.border);
+    opacity: ta.pressed ? 0.72 : 1;
+    Text {
+        text: root.label;
+        font-size: Fonts.size(11.5px);
+        font-weight: 600;
+        color: kind == 1 ? Theme.accent-fg : (kind == 3 ? Theme.err : Theme.text-2);
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 图标按钮（↑ ↓ ×）：无文字底，hover 才显形
+component IconBtn inherits Rectangle {
+    in property <string> glyph;
+    in property <int> kind: 0;
+    callback clicked();
+    width: 17px;
+    height: 17px;
+    border-radius: 4px;
+    background: ta.has-hover ? (kind == 1 ? Theme.err-soft : Theme.hover) : transparent;
+    Text {
+        text: root.glyph;
+        font-size: Fonts.size(11.5px);
+        color: kind == 1 ? Theme.err : Theme.text-3;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Check inherits Rectangle {
+    in property <bool> on: false;
+    callback toggled();
+    // 画面上仍是 13px 的小方框，但整体做成 24px 热区，免得点不中
+    width: 24px;
+    height: 24px;
+    background: transparent;
+    Rectangle {
+        x: (parent.width - 13px) / 2;
+        y: (parent.height - 13px) / 2;
+        width: 13px;
+        height: 13px;
+        border-radius: 3.5px;
+        background: root.on ? Theme.accent : (ta.has-hover ? Theme.hover : transparent);
+        border-width: 1px;
+        border-color: root.on ? Theme.accent : Theme.border-2;
+        // 不用 ✓ 字符：界面字体里是缺字形的方块，改成矢量勾
+        Path {
+            x: 2px;
+            y: 2.5px;
+            width: 9px;
+            height: 8px;
+            commands: "M 0 4.4 L 2.9 7.2 L 8.6 0.9";
+            stroke: Theme.accent-fg;
+            stroke-width: 1.8px;
+            visible: root.on;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+}
+
+// 自绘输入框：避免原生控件在暗色下风格割裂
+component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <length> w: 120px;
+    in property <length> h: 21px;
+    in property <bool> centered: false;
+    callback edited(string);
+    width: w;
+    height: h;
+    border-radius: 5px;
+    background: Theme.well;
+    border-width: 1px;
+    border-color: ti.has-focus ? Theme.accent-line : Theme.border;
+    // TextInput 没有 placeholder 属性，用一层文字兜底
+    Text {
+        x: 7px;
+        y: 0;
+        width: parent.width - 14px;
+        height: parent.height;
+        vertical-alignment: center;
+        horizontal-alignment: root.centered ? center : left;
+        text: root.placeholder;
+        font-family: Fonts.mono;
+        font-size: Fonts.size(11px);
+        color: Theme.text-3;
+        visible: ti.text == "";
+    }
+    ti := TextInput {
+        x: 6px;
+        y: 0;
+        width: parent.width - 12px;
+        height: parent.height;
+        vertical-alignment: center;
+        horizontal-alignment: root.centered ? center : left;
+        font-family: Fonts.mono;
+        font-size: Fonts.size(11px);
+        color: Theme.text;
+        selection-background-color: Theme.accent-soft;
+        selection-foreground-color: Theme.text;
+        text <=> root.text;
+        single-line: true;
+        edited => { root.edited(self.text); }
+    }
+}
+
+component Progress inherits Rectangle {
+    in property <int> value: 0;
+    in property <int> tone: 1;
+    height: 2px;
+    border-radius: 1px;
+    background: Theme.border;
+    Rectangle {
+        x: 0;
+        y: 0;
+        height: parent.height;
+        border-radius: 1px;
+        width: parent.width * (Math.max(0, Math.min(100, root.value)) * 1.0 / 100.0);
+        background: Tone.fg(root.tone);
+        animate width { duration: 240ms; easing: ease-out; }
+    }
+}
+
+// 暗色开关：滑块位置反映状态
+component ThemeSwitch inherits Rectangle {
+    in-out property <bool> on: true;
+    callback toggled();
+    width: 32px;
+    height: 17px;
+    border-radius: 8.5px;
+    background: on ? Theme.accent-soft : Theme.row-alt;
+    border-width: 1px;
+    border-color: on ? Theme.accent : Theme.border-2;
+    Rectangle {
+        width: 11px;
+        height: 11px;
+        border-radius: 5.5px;
+        y: 2px;
+        x: root.on ? root.width - 14px : 3px;
+        background: root.on ? Theme.accent : Theme.text-3;
+        animate x { duration: 160ms; easing: ease-out; }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+}
+
+component Panel inherits Rectangle {
+    background: Theme.panel;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: Theme.border;
+}
+
+component Rule inherits Rectangle {
+    height: 1px;
+    background: Theme.border;
+}
+
+component VRule inherits Rectangle {
+    width: 1px;
+    height: 16px;
+    background: Theme.border;
+}
+
+export component AppWindow inherits Window {
+    title: "Houdini 渲染队列";
+    width: 1600px;
+    height: 820px;
+    background: Theme.canvas;
+    // 统一字体入口：未单独指定字体的文字都继承这里
+    default-font-family: Fonts.body;
+    default-font-size: Fonts.size(11px);
+
+    in property <[string]> font-families;
+    in-out property <int> font-family-index: 0;
+    in property <[string]> font-size-labels;
+    in-out property <int> font-size-index: 1;
+    in-out property <bool> font-panel-open: false;
+    callback font-changed();
+
+    in property <[string]> houdini-versions;
+    in-out property <int> houdini-index: 0;
+    /// 当前工程的版本是否被手动锁定
+    in property <bool> version-pinned: false;
+    /// 当前工程可选/已选的 Houdini 版本：第 0 项是「自动」，其余为本机安装
+    in property <[string]> version-options;
+    in-out property <int> version-index: 0;
+    in property <[string]> concurrency-options: ["1", "2", "3", "4", "6", "8"];
+    in-out property <int> concurrency-index: 0;
+    in property <[string]> retry-options: ["不重试", "1 次", "2 次", "3 次"];
+    in-out property <int> retry-index: 2;
+
+    in-out property <[Shot]> shots;
+    in-out property <int> current-shot: 0;
+    in property <[OutNode]> nodes;
+    in property <[QTask]> queue;
+    in property <string> log-text;
+    in property <string> project-count;
+    in property <string> queue-count;
+    in property <string> shot-title;
+    in property <string> status-text;
+    in-out property <bool> follow-log: true;
+    in-out property <int> filter-index: 0;
+    in-out property <bool> only-unadded: false;
+    in property <string> node-empty-hint;
+    /// 有文件正悬停在窗口上（由 Rust 侧 OLE DragEnter/DragLeave 驱动）
+    in-out property <bool> drag-hover: false;
+    /// 最右侧日志列宽度
+    property <length> log-col-width: 360px;
+
+    callback add-files();
+    callback drop-transfer(data: data-transfer);
+    callback shot-selected(int);
+    callback remove-project(int);
+    callback toggle-node(int);
+    callback range-edited(int, string);
+    callback search-changed(string);
+    callback filter-changed(int);
+    callback toggle-unadded();
+    callback clear-finished();
+    callback start-all();
+    callback pause-all();
+    callback cancel-all();
+    callback task-cancel(string);
+    callback task-up(string);
+    callback task-down(string);
+    callback export-log();
+    callback houdini-changed(int);
+    callback concurrency-changed(int);
+    callback retry-changed(int);
+    callback select-all(bool);
+    callback reanalyze();
+    callback version-changed(int);
+    callback toggle-theme();
+
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: transparent;
+
+        VerticalLayout {
+            width: root.width;
+            height: root.height;
+            padding-top: 11px;
+            padding-bottom: 11px;
+            padding-left: 13px;
+            padding-right: 13px;
+            spacing: 9px;
+
+            // ── 顶栏 ──
+            Rectangle {
+                width: root.width - 26px;
+                height: 40px;
+                VerticalLayout {
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        // 队列铭牌
+                        Rectangle {
+                            width: 21px;
+                            height: 21px;
+                            border-radius: 6px;
+                            background: Theme.accent-soft;
+                            border-width: 1px;
+                            border-color: Theme.accent-line;
+                            VerticalLayout {
+                                x: 6px;
+                                y: 5px;
+                                width: 9px;
+                                spacing: 2px;
+                                Rectangle { height: 2px; border-radius: 1px; background: Theme.accent; }
+                                Rectangle { height: 2px; border-radius: 1px; background: Theme.accent; width: 6px; }
+                                Rectangle { height: 2px; border-radius: 1px; background: Theme.accent; width: 4px; }
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: 0px;
+                            alignment: center;
+                            Text {
+                                text: "Houdini 渲染队列";
+                                font-size: Fonts.size(14px);
+                                font-weight: 600;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                            }
+                            Tag { text: "LOCAL · 本机后台"; }
+                        }
+
+                        Text {
+                            text: root.status-text;
+                            font-size: Fonts.size(11px);
+                            color: Theme.text-3;
+                            vertical-alignment: center;
+                            vertical-stretch: 0;
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+
+                        Tag { text: "默认版本"; }
+                        ComboBox {
+                            model: root.houdini-versions;
+                            current-index <=> root.houdini-index;
+                            width: 122px;
+                            selected(v) => { root.houdini-changed(root.houdini-index); }
+                        }
+                        VRule { }
+                        Tag { text: "并发"; }
+                        ComboBox {
+                            model: root.concurrency-options;
+                            current-index <=> root.concurrency-index;
+                            width: 56px;
+                            selected(v) => { root.concurrency-changed(root.concurrency-index); }
+                        }
+                        Tag { text: "重试"; }
+                        ComboBox {
+                            model: root.retry-options;
+                            current-index <=> root.retry-index;
+                            width: 78px;
+                            selected(v) => { root.retry-changed(root.retry-index); }
+                        }
+                        VRule { }
+                        TBtn { label: "开始"; kind: 1; w: 54px; clicked => { root.start-all(); } }
+                        TBtn { label: "暂停"; w: 50px; clicked => { root.pause-all(); } }
+                        TBtn { label: "取消"; kind: 3; w: 50px; clicked => { root.cancel-all(); } }
+                        VRule { }
+                        TBtn { label: "字体"; w: 44px; clicked => { root.font-panel-open = true; } }
+                        ThemeSwitch {
+                            on: Theme.dark;
+                            toggled => { root.toggle-theme(); }
+                        }
+                    }
+                }
+            }
+
+            // ── 三栏 ──
+            HorizontalLayout {
+                width: root.width - 26px;
+                vertical-stretch: 1;
+                spacing: 9px;
+
+                // 左：工程
+                Panel {
+                    width: 202px;
+                    VerticalLayout {
+                        padding-top: 9px;
+                        padding-bottom: 9px;
+                        padding-left: 9px;
+                        padding-right: 9px;
+                        spacing: 7px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Tag { text: "PROJECTS"; }
+                            Tag { text: root.project-count; tint: Theme.text-2; }
+                            Rectangle { horizontal-stretch: 1; }
+                            TBtn { label: "+"; w: 20px; h: 20px; clicked => { root.add-files(); } }
+                        }
+                        Rule { }
+                        shots-sv := ScrollView {
+                            VerticalLayout {
+                                width: 184px;
+                                spacing: 2px;
+                                for shot[i] in root.shots: card := Rectangle {
+                                    // hover 判定要把删除按钮自己算进去，否则鼠标移到 × 上会闪
+                                    property <bool> hot: row-ta.has-hover || del-ta.has-hover;
+                                    height: 46px;
+                                    border-radius: 6px;
+                                    background: i == root.current-shot ? Theme.accent-soft
+                                              : (card.hot ? Theme.hover : transparent);
+                                    // 悬停层放在最底层，免得挡住其它可交互子元素
+                                    row-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.shot-selected(i); }
+                                    }
+                                    // 选中时的琥珀导条
+                                    Rectangle {
+                                        x: 0;
+                                        y: 11px;
+                                        width: 2px;
+                                        height: 24px;
+                                        border-radius: 1px;
+                                        background: Theme.accent;
+                                        opacity: i == root.current-shot ? 1 : 0;
+                                    }
+                                    VerticalLayout {
+                                        width: parent.width;
+                                        padding-top: 4px;
+                                        padding-bottom: 4px;
+                                        padding-left: 10px;
+                                        padding-right: 24px;
+                                        spacing: 0px;
+                                        Text {
+                                            text: shot.name;
+                                            font-size: Fonts.size(12px);
+                                            font-weight: 600;
+                                            color: i == root.current-shot ? Theme.accent : Theme.text;
+                                            overflow: elide;
+                                        }
+                                        Text { text: shot.sub; font-size: Fonts.size(10px); color: Theme.text-3; overflow: elide; }
+                                        // 制作版本 / 使用版本 + 节点数量
+                                        Text { text: shot.meta; font-size: Fonts.size(10px); color: Theme.text-3; overflow: elide; }
+                                    }
+                                    // 状态点：悬停时让位给删除按钮
+                                    Rectangle {
+                                        x: parent.width - 11px;
+                                        y: 19px;
+                                        width: 5px;
+                                        height: 5px;
+                                        border-radius: 2.5px;
+                                        background: Tone.fg(shot.tone);
+                                        visible: !card.hot;
+                                    }
+                                    // 删除该工程（连同它在执行区里的任务）
+                                    del := Rectangle {
+                                        x: parent.width - 23px;
+                                        y: 13px;
+                                        width: 17px;
+                                        height: 17px;
+                                        border-radius: 4px;
+                                        visible: card.hot;
+                                        background: del-ta.has-hover ? Theme.err-soft : transparent;
+                                        Text {
+                                            text: "×";
+                                            font-size: Fonts.size(12px);
+                                            color: Theme.err;
+                                            width: parent.width;
+                                            height: parent.height;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        del-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.remove-project(i); }
+                                        }
+                                    }
+                                }
+                                if root.shots.length == 0 : Text {
+                                    text: "拖入 hip 文件或文件夹\n或点 + 添加";
+                                    font-size: Fonts.size(11px);
+                                    color: Theme.text-3;
+                                    horizontal-alignment: center;
+                                    wrap: word-wrap;
+                                    height: 64px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 中：输出节点（宽度 = 窗口 - 左右边距 - 左栏 - 右栏 - 日志列 - 3 个间距）
+                Panel {
+                    width: root.width - 26px - 202px - 298px - root.log-col-width - 27px;
+                    VerticalLayout {
+                        padding-top: 9px;
+                        padding-bottom: 9px;
+                        padding-left: 9px;
+                        padding-right: 9px;
+                        spacing: 7px;
+
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Tag { text: "OUTPUT NODES"; }
+                            Text {
+                                text: root.shot-title;
+                                font-size: Fonts.size(11.5px);
+                                color: Theme.text-2;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            Chip { label: "全选"; w: 38px; clicked => { root.select-all(true); } }
+                            Chip { label: "全不选"; w: 46px; clicked => { root.select-all(false); } }
+                            Chip { label: "重新解析"; w: 58px; clicked => { root.reanalyze(); } }
+                        }
+
+                        // 每个 hip 独立的版本选择：默认「自动」= 跟随 hip 里记录的制作版本
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Tag { text: "HOUDINI 版本"; }
+                            ComboBox {
+                                model: root.version-options;
+                                current-index <=> root.version-index;
+                                width: 152px;
+                                enabled: root.shots.length > 0;
+                                selected(v) => { root.version-changed(root.version-index); }
+                            }
+                            if root.version-pinned : Tag { text: "已锁定"; tint: Theme.accent; }
+                            Text {
+                                text: "自动 = 按 hip 的制作版本选；也可手动锁定";
+                                font-size: Fonts.size(10.5px);
+                                color: Theme.text-3;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 5px;
+                            Field {
+                                placeholder: "搜索节点 / 路径";
+                                horizontal-stretch: 1;
+                                edited(t) => { root.search-changed(t); }
+                            }
+                            Chip { label: "全部"; w: 36px; active: root.filter-index == 0; clicked => { root.filter-changed(0); } }
+                            Chip { label: "缓存"; w: 36px; active: root.filter-index == 1; clicked => { root.filter-changed(1); } }
+                            Chip { label: "渲染"; w: 36px; active: root.filter-index == 2; clicked => { root.filter-changed(2); } }
+                            VRule { }
+                            Chip { label: "只看未加入"; w: 72px; active: root.only-unadded; clicked => { root.toggle-unadded(); } }
+                        }
+
+                        // 列头
+                        HorizontalLayout {
+                            spacing: 8px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            Rectangle { width: 24px; }
+                            Tag { text: "NODE / OUTPUT"; horizontal-stretch: 1; }
+                            Tag { text: "类型"; width: 108px; }
+                            Tag { text: "分类"; width: 44px; }
+                            Tag { text: "帧范围"; width: 100px; }
+                            Tag { text: "状态"; width: 60px; }
+                        }
+                        Rule { }
+
+                        nodes-sv := ScrollView {
+                            VerticalLayout {
+                                width: root.width - 26px - 202px - 298px - root.log-col-width - 45px;
+                                spacing: 0px;
+                                for node[i] in root.nodes: Rectangle {
+                                    width: parent.width;
+                                    height: 34px;
+                                    background: node-ta.has-hover ? Theme.hover : (Math.mod(i, 2) == 1 ? Theme.row-alt : transparent);
+                                    // 悬停层在最底层，勾选框和帧范围输入框才收得到点击；
+                                    // 点行内任意空白处也切换勾选，省得非要去点小方框
+                                    node-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.toggle-node(i); }
+                                    }
+                                    HorizontalLayout {
+                                        width: parent.width;
+                                        spacing: 8px;
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        Check {
+                                            on: node.checked;
+                                            toggled => { root.toggle-node(i); }
+                                        }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            alignment: center;
+                                            spacing: 0px;
+                                            Text {
+                                                text: node.path;
+                                                font-size: Fonts.size(12px);
+                                                color: node.checked ? Theme.text : Theme.text-2;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: node.output;
+                                                font-family: Fonts.mono;
+                                                font-size: Fonts.size(10px);
+                                                color: Theme.text-3;
+                                                overflow: elide;
+                                            }
+                                        }
+                                        Text {
+                                            text: node.ntype;
+                                            width: 108px;
+                                            font-family: Fonts.mono;
+                                            font-size: Fonts.size(9px);
+                                            color: Theme.text-2;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        Badge {
+                                            label: node.category;
+                                            w: 42px;
+                                            tone: node.category == "渲染" ? 4 : 5;
+                                        }
+                                        Field {
+                                            w: 100px;
+                                            h: 20px;
+                                            centered: true;
+                                            text: node.range;
+                                            edited(t) => { root.range-edited(i, t); }
+                                        }
+                                        Badge {
+                                            label: node.status;
+                                            w: 60px;
+                                            tone: node.tone;
+                                        }
+                                    }
+                                }
+                                if root.nodes.length == 0 : Text {
+                                    text: root.node-empty-hint;
+                                    font-size: Fonts.size(11px);
+                                    color: Theme.text-3;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    height: 90px;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 右：执行区
+                Panel {
+                    width: 298px;
+                    VerticalLayout {
+                        padding-top: 9px;
+                        padding-bottom: 9px;
+                        padding-left: 9px;
+                        padding-right: 9px;
+                        spacing: 7px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Tag { text: "QUEUE"; }
+                            Tag { text: root.queue-count; tint: Theme.text-2; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Chip { label: "清空完成"; w: 58px; clicked => { root.clear-finished(); } }
+                        }
+                        Rule { }
+                        queue-sv := ScrollView {
+                            VerticalLayout {
+                                width: 280px;
+                                spacing: 5px;
+                                for t[i] in root.queue: Rectangle {
+                                    height: 50px;
+                                    border-radius: 7px;
+                                    background: t.tone == 1 ? Theme.run-soft : (card-ta.has-hover ? Theme.hover : Theme.well);
+                                    border-width: 1px;
+                                    border-color: t.tone == 1 ? Theme.run-line
+                                                : t.tone == 3 ? Theme.err-line
+                                                : t.tone == 2 ? Theme.ok-line
+                                                : Theme.border;
+                                    card-ta := TouchArea { }
+                                    VerticalLayout {
+                                        width: parent.width;
+                                        padding-top: 6px;
+                                        padding-bottom: 6px;
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            Text {
+                                                text: t.title;
+                                                font-size: Fonts.size(11.5px);
+                                                font-weight: 600;
+                                                color: Theme.text;
+                                                horizontal-stretch: 1;
+                                                overflow: elide;
+                                                vertical-alignment: center;
+                                            }
+                                            IconBtn { glyph: "↑"; clicked => { root.task-up(t.nid); } }
+                                            IconBtn { glyph: "↓"; clicked => { root.task-down(t.nid); } }
+                                            IconBtn { glyph: "×"; kind: 1; clicked => { root.task-cancel(t.nid); } }
+                                            Badge { label: t.status; w: 42px; tone: t.tone; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            Text {
+                                                text: t.shot + " · " + t.category + " · " + t.range;
+                                                font-family: Fonts.mono;
+                                                font-size: Fonts.size(10px);
+                                                color: Theme.text-3;
+                                                horizontal-stretch: 1;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: t.frames;
+                                                font-family: Fonts.mono;
+                                                font-size: Fonts.size(10px);
+                                                color: Theme.text-2;
+                                            }
+                                        }
+                                        Progress { value: t.progress; tone: t.tone == 0 ? 1 : t.tone; }
+                                    }
+                                }
+                                if root.queue.length == 0 : Text {
+                                    text: "勾选节点即自动入队\n缓存排在渲染之前";
+                                    font-size: Fonts.size(11px);
+                                    color: Theme.text-3;
+                                    horizontal-alignment: center;
+                                    height: 64px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 最右：日志（独立一列）
+                Panel {
+                    width: root.log-col-width;
+                    VerticalLayout {
+                        padding-top: 9px;
+                        padding-bottom: 9px;
+                        padding-left: 9px;
+                        padding-right: 9px;
+                        spacing: 7px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Tag { text: "LOG"; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Chip { label: "跟随"; w: 42px; active: root.follow-log; clicked => { root.follow-log = !root.follow-log; } }
+                            Chip { label: "导出"; w: 42px; clicked => { root.export-log(); } }
+                        }
+                        Rule { }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: Theme.dark ? #0c0e11 : #fbfaf8;
+                            log-sv := ScrollView {
+                                VerticalLayout {
+                                    width: root.log-col-width - 20px;
+                                    padding-top: 7px;
+                                    padding-bottom: 7px;
+                                    padding-left: 11px;
+                                    padding-right: 11px;
+                                    alignment: start;
+                                    Text {
+                                        text: root.log-text;
+                                        font-size: Fonts.size(10.5px);
+                                        color: Theme.dark ? #a8a49b : #55534e;
+                                        font-family: Fonts.mono;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 拖入提示：有文件悬停在窗口上时整窗描边（由 Rust 侧 OLE 事件驱动）
+        Rectangle {
+            visible: root.drag-hover;
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: parent.height - 16px;
+            border-width: 2px;
+            border-color: Theme.accent;
+            border-radius: 11px;
+            background: transparent;
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: 12px;
+                width: 128px;
+                height: 26px;
+                border-radius: 13px;
+                background: Theme.accent;
+                Text {
+                    text: "松开即导入";
+                    color: Theme.accent-fg;
+                    font-size: Fonts.size(12px);
+                    font-weight: 600;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // 注意：Slint 1.19 的 winit 后端收不到系统级文件拖放，从资源管理器拖入走的是
+        // Rust 侧 windrop.rs（OLE IDropTarget）。这里保留 DropArea 只为应用内部拖拽。
+        DropArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            can-drop(e) => { return DragAction.copy; }
+            dropped(e) => {
+                root.drop-transfer(e.data);
+                return DragAction.copy;
+            }
+        }
+
+        // ── 字体设置浮层 ──
+        Rectangle {
+            visible: root.font-panel-open;
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            background: #000000aa;
+            // 点遮罩关闭
+            ta-mask := TouchArea {
+                clicked => { root.font-panel-open = false; }
+            }
+            Rectangle {
+                x: (parent.width - 500px) / 2;
+                y: (parent.height - 306px) / 2;
+                width: 500px;
+                height: 322px;
+                border-radius: 12px;
+                background: Theme.panel;
+                border-width: 1px;
+                border-color: Theme.border-2;
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+                    Text {
+                        text: "字体设置";
+                        font-size: Fonts.size(16px);
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Tag { text: "界面字体"; width: 76px; }
+                        ComboBox {
+                            model: root.font-families;
+                            current-index <=> root.font-family-index;
+                            horizontal-stretch: 1;
+                            selected(v) => { root.font-changed(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Tag { text: "字号"; width: 76px; }
+                        ComboBox {
+                            model: root.font-size-labels;
+                            current-index <=> root.font-size-index;
+                            width: 180px;
+                            selected(v) => { root.font-changed(); }
+                        }
+                    }
+                    Rectangle {
+                        height: 66px;
+                        border-radius: 7px;
+                        background: Theme.well;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        VerticalLayout {
+                            padding-left: 13px;
+                            padding-top: 9px;
+                            spacing: 3px;
+                            Text {
+                                text: "预览 · Houdini 渲染队列";
+                                font-size: Fonts.size(13px);
+                                font-weight: 600;
+                                color: Theme.text;
+                            }
+                            Text {
+                                text: "/stage/bg   usdrender_rop   1001-1072   已加入执行区";
+                                color: Theme.text-2;
+                            }
+                        }
+                    }
+                    Text {
+                        text: "修改后立即生效并保存，下次启动依然保持";
+                        font-size: Fonts.size(10px);
+                        color: Theme.text-3;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        TBtn {
+                            label: "恢复默认";
+                            w: 84px;
+                            clicked => {
+                                root.font-family-index = 0;
+                                root.font-size-index = 1;
+                                root.font-changed();
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        TBtn { label: "关闭"; kind: 1; w: 70px; clicked => { root.font-panel-open = false; } }
+                    }
+                }
+            }
+        }
+    }
+}
