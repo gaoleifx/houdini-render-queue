@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,7 +24,8 @@ pub enum Cmd {
     Pause,
     CancelAll,
     CancelOne(String),
-    ClearFinished,
+    /// 全部任务清零重跑：帧进度、重试次数一并清掉，然后立刻开始
+    RestartAll,
     SetConcurrency(usize),
     SetRetries(u32),
     Shutdown,
@@ -102,107 +103,145 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
 
     let _ = evt.send(Event::Queue(snapshot(&rt)));
 
+    // 上一轮 recv_timeout 抢到的指令，留到这一轮开头处理
+    let mut pending_cmd: Option<Cmd> = None;
     loop {
         // ── 指令 ──
         loop {
-            match rx.try_recv() {
-                Ok(cmd) => match cmd {
-                    Cmd::Shutdown => return,
-                    Cmd::SetJobs(specs) => {
-                        let mut old: HashMap<String, Rt> =
-                            rt.drain(..).map(|r| (r.spec.id.clone(), r)).collect();
-                        let mut next: Vec<Rt> = Vec::with_capacity(specs.len());
-                        for spec in specs {
-                            if let Some(mut r) = old.remove(&spec.id) {
-                                r.spec = spec;
-                                next.push(r);
-                            } else {
-                                let done = done_cache.remove(&spec.id).unwrap_or_default();
-                                next.push(Rt {
-                                    spec,
-                                    status: JobStatus::Queued,
-                                    attempts: 0,
-                                    done,
-                                    cancel: Arc::new(AtomicBool::new(false)),
-                                    running: false,
-                                    message: String::new(),
-                                    detached: false,
-                                });
-                            }
+            let cmd = match pending_cmd.take() {
+                Some(c) => c,
+                None => match rx.try_recv() {
+                    Ok(c) => c,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                },
+            };
+            match cmd {
+                Cmd::Shutdown => return,
+                Cmd::SetJobs(specs) => {
+                    let mut old: HashMap<String, Rt> =
+                        rt.drain(..).map(|r| (r.spec.id.clone(), r)).collect();
+                    let mut next: Vec<Rt> = Vec::with_capacity(specs.len());
+                    for spec in specs {
+                        if let Some(mut r) = old.remove(&spec.id) {
+                            r.spec = spec;
+                            next.push(r);
+                        } else {
+                            let done = done_cache.remove(&spec.id).unwrap_or_default();
+                            next.push(Rt {
+                                spec,
+                                status: JobStatus::Queued,
+                                attempts: 0,
+                                done,
+                                cancel: Arc::new(AtomicBool::new(false)),
+                                running: false,
+                                message: String::new(),
+                                detached: false,
+                            });
                         }
-                        // 被移出执行区的任务：还在跑的要求它停下（跑完当前帧），
-                        // 结束后由 detached 标记负责清理；其它直接删库
-                        for (id, mut r) in old {
-                            if r.running {
-                                r.detached = true;
-                                r.cancel.store(true, Ordering::SeqCst);
-                                next.push(r);
-                            } else {
-                                db.delete_job(&id);
-                            }
-                        }
-                        rt = next;
-                        for (i, r) in rt.iter().enumerate() {
-                            db.save_job(&r.spec, i as i64, r.status, r.attempts);
-                        }
-                        // 增删任务也算状态变化，必须回传，否则界面勾选状态永远不变
-                        let _ = evt.send(Event::Queue(snapshot(&rt)));
                     }
-                    Cmd::Start => {
+                    // 被移出执行区的任务：还在跑的要求它停下（跑完当前帧），
+                    // 结束后由 detached 标记负责清理；其它直接删库
+                    for (id, mut r) in old {
+                        if r.running {
+                            r.detached = true;
+                            r.cancel.store(true, Ordering::SeqCst);
+                            next.push(r);
+                        } else {
+                            db.delete_job(&id);
+                        }
+                    }
+                    rt = next;
+                    // 一次事务写完，任务多的时候不至于卡在逐条提交上
+                    let batch: Vec<(&JobSpec, i64, JobStatus, u32)> = rt
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (&r.spec, i as i64, r.status, r.attempts))
+                        .collect();
+                    db.save_jobs(&batch);
+                    // 增删任务也算状态变化，必须回传，否则界面勾选状态永远不变
+                    let _ = evt.send(Event::Queue(snapshot(&rt)));
+                }
+                Cmd::Start => {
+                    for r in rt.iter_mut() {
+                        if matches!(
+                            r.status,
+                            JobStatus::Canceled | JobStatus::Failed | JobStatus::Skipped
+                        ) {
+                            r.status = JobStatus::Queued;
+                            r.attempts = 0;
+                            r.message.clear();
+                        }
+                    }
+                    state = RunState::Running;
+                    let pending = rt.iter().filter(|r| r.status == JobStatus::Queued).count();
+                    log(&evt, format!("开始执行，待跑 {} 个任务，并发 {}", pending, concurrency));
+                }
+                Cmd::Pause => {
+                    state = RunState::Paused;
+                    log(&evt, "已暂停：不再启动新任务，正在跑的任务会继续".into());
+                }
+                Cmd::CancelAll => {
+                    state = RunState::Idle;
+                    for r in rt.iter_mut() {
+                        if r.running {
+                            r.cancel.store(true, Ordering::SeqCst);
+                        } else if r.status == JobStatus::Queued {
+                            r.status = JobStatus::Canceled;
+                            db.save_job(&r.spec, 0, r.status, r.attempts);
+                        }
+                    }
+                    log(&evt, "已取消队列（正在跑的任务会在当前帧结束后停止）".into());
+                }
+                Cmd::CancelOne(id) => {
+                    if let Some(r) = rt.iter_mut().find(|r| r.spec.id == id) {
+                        if r.running {
+                            r.cancel.store(true, Ordering::SeqCst);
+                        } else {
+                            r.status = JobStatus::Canceled;
+                            db.save_job(&r.spec, 0, r.status, r.attempts);
+                        }
+                    }
+                }
+                Cmd::RestartAll => {
+                    if rt.is_empty() {
+                        log(&evt, "执行区是空的，没有可重跑的任务".into());
+                    } else {
+                        let mut reset = 0usize;
                         for r in rt.iter_mut() {
-                            if matches!(
-                                r.status,
-                                JobStatus::Canceled | JobStatus::Failed | JobStatus::Skipped
-                            ) {
-                                r.status = JobStatus::Queued;
-                                r.attempts = 0;
-                                r.message.clear();
+                            // 正在跑的不动：硬重置会把已经渲到一半的帧丢掉
+                            if r.running {
+                                continue;
                             }
+                            r.status = JobStatus::Queued;
+                            r.attempts = 0;
+                            r.message.clear();
+                            r.done.clear();
+                            db.clear_frames(&r.spec.id);
+                            reset += 1;
+                        }
+                        if reset > 0 {
+                            let batch: Vec<(&JobSpec, i64, JobStatus, u32)> = rt
+                                .iter()
+                                .enumerate()
+                                .map(|(i, r)| (&r.spec, i as i64, r.status, r.attempts))
+                                .collect();
+                            db.save_jobs(&batch);
                         }
                         state = RunState::Running;
-                        let pending = rt.iter().filter(|r| r.status == JobStatus::Queued).count();
-                        log(&evt, format!("开始执行，待跑 {} 个任务，并发 {}", pending, concurrency));
-                    }
-                    Cmd::Pause => {
-                        state = RunState::Paused;
-                        log(&evt, "已暂停：不再启动新任务，正在跑的任务会继续".into());
-                    }
-                    Cmd::CancelAll => {
-                        state = RunState::Idle;
-                        for r in rt.iter_mut() {
-                            if r.running {
-                                r.cancel.store(true, Ordering::SeqCst);
-                            } else if r.status == JobStatus::Queued {
-                                r.status = JobStatus::Canceled;
-                                db.save_job(&r.spec, 0, r.status, r.attempts);
-                            }
+                        if reset > 0 {
+                            log(
+                                &evt,
+                                format!("重新开始：{reset} 个任务已清零进度，回到排队"),
+                            );
+                        } else {
+                            log(&evt, "重新开始：任务都在运行中，这里没有可重置的任务".into());
                         }
-                        log(&evt, "已取消队列（正在跑的任务会在当前帧结束后停止）".into());
+                        let _ = evt.send(Event::Queue(snapshot(&rt)));
                     }
-                    Cmd::CancelOne(id) => {
-                        if let Some(r) = rt.iter_mut().find(|r| r.spec.id == id) {
-                            if r.running {
-                                r.cancel.store(true, Ordering::SeqCst);
-                            } else {
-                                r.status = JobStatus::Canceled;
-                                db.save_job(&r.spec, 0, r.status, r.attempts);
-                            }
-                        }
-                    }
-                    Cmd::ClearFinished => {
-                        rt.retain(|r| {
-                            let keep = !r.status.is_finished();
-                            if !keep {
-                                db.delete_job(&r.spec.id);
-                            }
-                            keep
-                        });
-                    }
-                    Cmd::SetConcurrency(n) => concurrency = n.max(1),
-                    Cmd::SetRetries(n) => max_retries = n,
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                }
+                Cmd::SetConcurrency(n) => concurrency = n.max(1),
+                Cmd::SetRetries(n) => max_retries = n,
             }
         }
 
@@ -361,7 +400,12 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
             let _ = evt.send(Event::Queue(snapshot(&rt)));
         }
 
-        thread::sleep(Duration::from_millis(120));
+        // 没有指令时才等：勾选/增删任务能立刻处理，界面不用干等 120ms
+        match rx.recv_timeout(Duration::from_millis(120)) {
+            Ok(c) => pending_cmd = Some(c),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
@@ -526,6 +570,14 @@ fn run_worker(
                                 f
                             )));
                         }
+                    }
+                    "NOTE" => {
+                        let _ = evt.send(Event::Log(format!(
+                            "{}  [{}] {}",
+                            pyproc::now_hms(),
+                            title,
+                            arg
+                        )));
                     }
                     "PREFLIGHT" => {
                         result = Some(WResult::Preflight(arg.to_string()));

@@ -25,6 +25,8 @@ mod imp {
     const WM_COPYDATA: u32 = 0x004A;
     /// WM_COPYGLOBALDATA：shell 传 OLE 数据时用的，UIPI 也拦它
     const WM_COPYGLOBALDATA: u32 = 0x0049;
+    const WM_LBUTTONDOWN: u32 = 0x0201;
+    const WM_LBUTTONUP: u32 = 0x0202;
 
     /// 子类化 ID，随便取一个不会撞的值
     const SUBCLASS_ID: usize = 0x4852_5100;
@@ -41,6 +43,22 @@ mod imp {
     /// 成功落下的次数，自检/日志用
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
     static SUBCLASSED: AtomicBool = AtomicBool::new(false);
+
+    /// 双击识别：自己数，不依赖窗口类有没有 CS_DBLCLKS。
+    /// `down` 记按下点（拖选结束的那一下不算点击），`last` 记上一次「无位移点击」的时间与位置。
+    struct ClickTrack {
+        down: Option<(i32, i32)>,
+        last: Option<(u32, i32, i32)>,
+    }
+    static CLICKS: Mutex<ClickTrack> = Mutex::new(ClickTrack {
+        down: None,
+        last: None,
+    });
+    /// 有待处理的「双击」，值为窗口客户区坐标（物理像素）
+    static DOUBLE_CLICK: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+    /// 双击允许的时间窗（毫秒）与位移（像素）
+    const DBL_MS: u32 = 450;
+    const DBL_SLOP: i32 = 4;
 
     // ───────────────────────── Win32 声明 ─────────────────────────
 
@@ -67,6 +85,8 @@ mod imp {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn PostMessageW(hwnd: isize, msg: u32, wp: usize, lp: isize) -> i32;
+        fn SendMessageW(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isize;
+        fn LoadIconW(instance: isize, name: *const u16) -> isize;
         fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
         fn ChangeWindowMessageFilterEx(
             hwnd: isize,
@@ -98,10 +118,12 @@ mod imp {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
+        fn GetModuleHandleW(name: *const u16) -> isize;
         fn CloseHandle(h: isize) -> i32;
         fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
         fn GlobalLock(h: isize) -> *mut u8;
         fn GlobalUnlock(h: isize) -> i32;
+        fn GetTickCount() -> u32;
     }
 
     // ───────────────────────── 状态上报 ─────────────────────────
@@ -213,7 +235,51 @@ mod imp {
             }
             return 0;
         }
+        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP {
+            track_click(msg, lp);
+        }
         unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+    }
+
+    /// 从 WM_LBUTTONxxx 的 lParam 里取客户区坐标（有符号 16 位两段）
+    fn client_xy(lp: isize) -> (i32, i32) {
+        let v = lp as i32;
+        (((v & 0xFFFF) as i16) as i32, (((v >> 16) & 0xFFFF) as i16) as i32)
+    }
+
+    /// 自己数双击：按下记点、抬起判断「没位移 + 两次间隔够近」。
+    /// 拖选（按住移动）在抬起时位移超出阈值，一律不算点击。命中后清空参照，
+    /// 三连击不会重复报两次。
+    fn track_click(msg: u32, lp: isize) {
+        let (x, y) = client_xy(lp);
+        if msg == WM_LBUTTONDOWN {
+            if let Ok(mut c) = CLICKS.lock() {
+                c.down = Some((x, y));
+            }
+            return;
+        }
+        let now = unsafe { GetTickCount() };
+        let mut fire = false;
+        if let Ok(mut c) = CLICKS.lock() {
+            let dragged = matches!(c.down, Some((dx, dy))
+                if (dx - x).abs() > DBL_SLOP || (dy - y).abs() > DBL_SLOP);
+            c.down = None;
+            if dragged {
+                c.last = None;
+            } else {
+                let hit = matches!(c.last, Some((t, px, py))
+                    if now.wrapping_sub(t) <= DBL_MS
+                        && (px - x).abs() <= DBL_SLOP
+                        && (py - y).abs() <= DBL_SLOP);
+                c.last = if hit { None } else { Some((now, x, y)) };
+                fire = hit;
+            }
+        }
+        if fire {
+            if let Ok(mut q) = DOUBLE_CLICK.lock() {
+                *q = Some((x, y));
+            }
+        }
     }
 
     // ───────────────────────── 主通道：OLE IDropTarget ─────────────────────────
@@ -498,6 +564,12 @@ mod imp {
         HOVERING.load(Ordering::SeqCst)
     }
 
+    /// 取走一次「双击」，返回值是窗口客户区坐标（物理像素）。
+    /// 双击「整段选中」靠它：Slint 的 TextInput 双击只按词选，帧范围 "1-240" 会被拆开。
+    pub fn take_double_click() -> Option<(i32, i32)> {
+        DOUBLE_CLICK.lock().ok().and_then(|mut q| q.take())
+    }
+
     /// 累计成功接收的次数。
     pub fn drop_count() -> usize {
         DROP_COUNT.load(Ordering::SeqCst)
@@ -518,6 +590,30 @@ mod imp {
             // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE（Win10 20H1+），19 是老版本号
             if DwmSetWindowAttribute(hwnd, 20, &flag, 4) != 0 {
                 DwmSetWindowAttribute(hwnd, 19, &flag, 4);
+            }
+        }
+    }
+
+    /// 补上「大图标」。
+    /// winit 的 set_window_icon（Slint 的 `icon:` 走这里）只设 ICON_SMALL，
+    /// 任务栏缩略图 / Alt+Tab 用的 ICON_BIG 位留空，会退回系统默认图标。
+    /// 这里直接从 exe 资源里取 app.rc 声明的图标（id = 1）塞进去。
+    pub fn set_big_icon(hwnd: isize) {
+        if hwnd == 0 {
+            return;
+        }
+        const WM_SETICON: u32 = 0x0080;
+        const ICON_BIG: usize = 1;
+        const ICON_ID: usize = 1; // assets/app.rc: 1 ICON "app.ico"
+        unsafe {
+            let inst = GetModuleHandleW(std::ptr::null());
+            if inst == 0 {
+                return;
+            }
+            // MAKEINTRESOURCE(1)：把序号当地址传
+            let icon = LoadIconW(inst, ICON_ID as *const u16);
+            if icon != 0 {
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG, icon);
             }
         }
     }
@@ -592,6 +688,10 @@ mod imp {
         false
     }
 
+    pub fn take_double_click() -> Option<(i32, i32)> {
+        None
+    }
+
     pub fn drop_count() -> usize {
         0
     }
@@ -601,10 +701,13 @@ mod imp {
     }
 
     pub fn set_dark_titlebar(_hwnd: isize, _dark: bool) {}
+
+    pub fn set_big_icon(_hwnd: isize) {}
 }
 
 pub use imp::{
-    Report, drop_count, install, is_hovering, post_drop, set_dark_titlebar, take_dropped,
+    Report, drop_count, install, is_hovering, post_drop, set_big_icon, set_dark_titlebar,
+    take_double_click, take_dropped,
 };
 
 /// 从 Slint 窗口取出原生窗口句柄（Windows 的 HWND）。

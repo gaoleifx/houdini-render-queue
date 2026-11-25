@@ -6,10 +6,11 @@
 
 - **拖入 hip**：支持从资源管理器拖入文件或文件夹，也可点 `+` 添加
 - **自动分析**：识别 `/out` 的 ROP、`/stage` 的 LOP 渲染节点，以及 `/obj` 下的 File Cache SOP（`filecache::2.0`）
-- **逐节点设置**：每个节点独立修改帧范围，勾选即入队；缓存排在渲染之前
+- **逐节点设置**：每个节点独立修改帧范围（单击定位光标、双击整段选中），勾选即入队；缓存排在渲染之前
 - **Houdini 版本**：探测本机所有安装；每个 hip 默认按文件里记录的制作版本匹配，也可手动锁定
 - **执行控制**：默认串行，并发数可调；失败重试；按帧断点续渲；预检输出目录与磁盘空间
-- **界面**：三栏布局 + 最右侧独立日志列；暗/亮主题；统一字体设置；跟随与导出日志
+- **队列整理**：执行区卡片可上下调序、单条取消；「清空完成」摘掉已结束的任务；「重新开始」清零全部帧进度并重跑整批（两步确认，防误触）
+- **界面**：三栏布局 + 最右侧独立日志列；底部状态栏显示当前 hip 完整路径与版本/节点统计；暗/亮主题；统一字体设置；跟随与导出日志
 
 ## 结构
 
@@ -19,6 +20,8 @@ ui/app.slint  Slint 界面定义
 python/
   analyze.py  在 hython 中加载 hip，枚举输出节点，输出 JSON
   render.py   在 hython 中按帧执行，逐帧回报进度，支持取消与断点续渲
+assets/       app.ico（exe 图标）+ app.png（窗口图标）+ app.rc（资源脚本）
+tools/        make_icon.py 生成图标；peek_icon.py / peek_window_icon.py 校验图标是否生效
 devtest/      不启动 Houdini 也能跑回归的假 hou 模块
 ```
 
@@ -31,6 +34,20 @@ cargo build --release
 ```
 
 产物在 `target/release/houdini-render-queue.exe`。运行时把 `python/` 目录放在 exe 同级，程序会按 `exe/python/` 定位脚本。
+
+release 构建使用 Windows 图形子系统，双击不弹控制台窗口；`cargo build`（debug）仍保留控制台，便于看 `eprintln!` 日志。hython 子进程统一走 `pyproc::hidden()`，带 `CREATE_NO_WINDOW`，不会闪黑框。
+
+### 图标
+
+`build.rs` 会调用 Windows SDK 的 `rc.exe` 把 `assets/app.rc`（内含 `app.ico`）编进 exe；rc.exe 不在 PATH 时按 `RC` 环境变量 → PATH → `Windows Kits\10\bin\*` 顺序自动找，找不到只警告、不影响构建。窗口图标走 `ui/app.slint` 的 `icon:`（`assets/app.png`），任务栏大图标由 `windrop::set_big_icon()` 从 exe 资源补上（winit 只设小图标）。
+
+改图标：编辑 `tools/make_icon.py` 的配色/形状后
+
+```bash
+python tools/make_icon.py --variant b --preview out.png   # 先看效果
+python tools/make_icon.py --variant b                     # 生成 assets/app.ico + app.png
+python tools/peek_icon.py dist/houdini-render-queue.exe check.png   # 校验 exe 图标
+```
 
 ## 运行
 
@@ -46,6 +63,7 @@ cargo build --release
 --set-font <字体> <字号> 调试：切换字体并落库
 --set-version <下标>     调试：切换当前工程的 Houdini 版本
 --font-panel             调试：直接打开字体面板
+--debug-invoke <回调名>  调试：直接触发一次按钮回调（clear-finished / restart-all），配合 --snapshot 做回归
 ```
 
 ## 环境

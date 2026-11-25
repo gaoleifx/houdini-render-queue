@@ -1,4 +1,4 @@
-import { ComboBox, ScrollView, Palette } from "std-widgets.slint";
+import { ComboBox, ListView, ScrollView, Palette } from "std-widgets.slint";
 
 // 导出给 Rust：暗色下标准控件的配色只能从宿主语言设置
 export { Palette }
@@ -18,6 +18,8 @@ export global Theme {
     out property <color> canvas: dark ? #101216 : #f3f2ef;
     out property <color> panel: dark ? #171a1f : #ffffff;
     out property <color> well: dark ? #1d2127 : #f7f6f3;
+    // 输入框聚焦时的底：暖调提亮一档，配琥珀描边说明"正在编辑这一格"
+    out property <color> well-focus: dark ? #3a3126 : #fdf4e4;
     out property <color> hover: dark ? #232830 : #efede8;
     out property <color> row-alt: dark ? #1a1d23 : #faf9f6;
     out property <color> border: dark ? #262b33 : #e4e2dc;
@@ -34,6 +36,9 @@ export global Theme {
     out property <color> accent-fg: dark ? #171008 : #ffffff;
     out property <color> accent-soft: dark ? #2a2318 : #f7ecda;
     out property <color> accent-line: dark ? #4d3d26 : #e2cba6;
+    // 文本选区底：accent-soft 与输入框底色几乎同色，选中文字在暗色下看不出来，
+    // 选区单独用一档更亮的暖色，浅字压上去仍读得清
+    out property <color> select: dark ? #7d6340 : #dcc09b;
 
     // 状态
     out property <color> ok: dark ? #77b97f : #3f7d3c;
@@ -177,6 +182,93 @@ component TBtn inherits Rectangle {
     }
 }
 
+// 紧凑下拉：底色 / 描边 / 圆角 / 字重全部与 TBtn 同源，只比按钮多一枚小箭头，
+// 这样「并发 / 重试」和右侧几个按钮是同一尺寸、同一条水平中线。
+// 不用 std 的 ComboBox：它自带内边距和较大的字号，56~64px 装不下「2 次」，还会比按钮高出一头。
+component MiniSel inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> index: 0;
+    in property <length> w: 64px;
+    callback picked(int);
+
+    width: w;
+    height: 25px;
+    border-radius: 6px;
+    background: ta.has-hover ? Theme.hover : Theme.well;
+    border-width: 1px;
+    border-color: ta.has-hover ? Theme.border-2 : Theme.border;
+
+    Text {
+        x: 8px;
+        width: parent.width - 8px - 20px;
+        height: parent.height;
+        text: root.options[root.index];
+        font-size: Fonts.size(11.5px);
+        font-weight: 600;
+        color: Theme.text-2;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    // 手绘 chevron，不依赖字体里有没有 ▾
+    Path {
+        x: parent.width - 17px;
+        y: (parent.height - 4px) / 2;
+        width: 8px;
+        height: 5px;
+        commands: "M 0 0 L 4 4.2 L 8 0";
+        stroke: Theme.text-3;
+        stroke-width: 1.2px;
+        fill: transparent;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { pop.show(); }
+    }
+    pop := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: max(root.width, 96px);
+        height: root.options.length * 24px + 8px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Theme.panel;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: Theme.border-2;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000055;
+            drop-shadow-offset-y: 6px;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 1px;
+                for o[i] in root.options : Rectangle {
+                    height: 24px;
+                    border-radius: 5px;
+                    background: row-ta.has-hover ? Theme.hover
+                              : (i == root.index ? Theme.accent-soft : transparent);
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: o;
+                        font-size: Fonts.size(11.5px);
+                        color: i == root.index ? Theme.accent : Theme.text-2;
+                        vertical-alignment: center;
+                    }
+                    row-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.index = i;
+                            root.picked(i);
+                            pop.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // 图标按钮（↑ ↓ ×）：无文字底，hover 才显形
 component IconBtn inherits Rectangle {
     in property <string> glyph;
@@ -198,6 +290,34 @@ component IconBtn inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+// 排序箭头：↑↓ 字符在界面字体里常缺字形，11px 下又细又灰，几乎看不见。
+// 改成实心三角形矢量图，颜色用 text-2（比 text-3 亮一档），hover 变琥珀；
+// 到顶 / 到底时置灰，一眼就能看出这行还能不能移动。
+component ArrowBtn inherits Rectangle {
+    in property <bool> dir-up: true;
+    in property <bool> can-move: true;
+    callback clicked();
+    width: 19px;
+    height: 19px;
+    border-radius: 4px;
+    opacity: root.can-move ? 1 : 0.32;
+    background: root.can-move && ta.has-hover ? Theme.accent-soft : transparent;
+    border-width: 1px;
+    border-color: root.can-move && ta.has-hover ? Theme.accent-line : transparent;
+    Path {
+        x: (parent.width - 10px) / 2;
+        y: (parent.height - 7px) / 2;
+        width: 10px;
+        height: 7px;
+        fill: ta.has-hover ? Theme.accent : Theme.text-2;
+        commands: root.dir-up ? "M 0 7 L 5 0 L 10 7 Z" : "M 0 0 L 5 7 L 10 0 Z";
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { if (root.can-move) { root.clicked(); } }
     }
 }
 
@@ -235,6 +355,17 @@ component Check inherits Rectangle {
     }
 }
 
+// 输入框的跨端小动作。双击「整段选中」Slint 自己做不到——TextInput 的双击是按「词」选的，
+// 帧范围 "1-240" 只会选中 "1" 或 "240"；所以由 Rust 在窗口过程里数双击，把双击点的窗口坐标
+// （逻辑像素）连同计数器写进这里，各个 Field 自己判断是否被命中。
+export global FieldActions {
+    /// 双击次数，每次 +1（坐标相同时也要能再次触发）
+    in-out property <int> tick: 0;
+    /// 双击点的窗口坐标，逻辑像素
+    in-out property <int> x: 0;
+    in-out property <int> y: 0;
+}
+
 // 自绘输入框：避免原生控件在暗色下风格割裂
 component Field inherits Rectangle {
     in-out property <string> text;
@@ -243,12 +374,26 @@ component Field inherits Rectangle {
     in property <length> h: 21px;
     in property <bool> centered: false;
     callback edited(string);
+    /// 转发 FieldActions.tick，才能用 changed 监听（Slint 的 changed 只认裸标识符）
+    private property <int> dbl-tick: FieldActions.tick;
     width: w;
     height: h;
     border-radius: 5px;
-    background: Theme.well;
+    // 点中就亮：底色转暖调 + 描边转琥珀，一眼看出正在编辑哪一格
+    background: ti.has-focus ? Theme.well-focus : Theme.well;
+    animate background { duration: 110ms; easing: ease-out; }
     border-width: 1px;
-    border-color: ti.has-focus ? Theme.accent-line : Theme.border;
+    border-color: ti.has-focus ? Theme.accent : Theme.border;
+    // 双击整段选中：只有被双击命中、且正在编辑的那一格才动，别的格不响应
+    changed dbl-tick => {
+        if (ti.has-focus
+            && FieldActions.x * 1px >= self.absolute-position.x
+            && FieldActions.x * 1px <= self.absolute-position.x + self.width
+            && FieldActions.y * 1px >= self.absolute-position.y
+            && FieldActions.y * 1px <= self.absolute-position.y + self.height) {
+            ti.select-all();
+        }
+    }
     // TextInput 没有 placeholder 属性，用一层文字兜底
     Text {
         x: 7px;
@@ -273,7 +418,7 @@ component Field inherits Rectangle {
         font-family: Fonts.mono;
         font-size: Fonts.size(11px);
         color: Theme.text;
-        selection-background-color: Theme.accent-soft;
+        selection-background-color: Theme.select;
         selection-foreground-color: Theme.text;
         text <=> root.text;
         single-line: true;
@@ -343,6 +488,8 @@ component VRule inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Houdini 渲染队列";
+    // 标题栏 / 任务栏图标：与 exe 内嵌图标（assets/app.ico）同一套设计
+    icon: @image-url("../assets/app.png");
     width: 1600px;
     height: 820px;
     background: Theme.canvas;
@@ -357,8 +504,6 @@ export component AppWindow inherits Window {
     in-out property <bool> font-panel-open: false;
     callback font-changed();
 
-    in property <[string]> houdini-versions;
-    in-out property <int> houdini-index: 0;
     /// 当前工程的版本是否被手动锁定
     in property <bool> version-pinned: false;
     /// 当前工程可选/已选的 Houdini 版本：第 0 项是「自动」，其余为本机安装
@@ -378,14 +523,45 @@ export component AppWindow inherits Window {
     in property <string> queue-count;
     in property <string> shot-title;
     in property <string> status-text;
+    /// 顶栏状态灯：0 空闲 / 1 运行 / 3 有失败 / 4 待执行
+    in property <int> status-tone: 0;
+    /// 底部状态栏：当前选中 hip 的完整路径（空串 = 还没导入工程）
+    in property <string> status-hip;
+    /// 底部状态栏右侧信息：Houdini 版本 / 节点统计
+    in property <string> status-meta;
     in-out property <bool> follow-log: true;
     in-out property <int> filter-index: 0;
     in-out property <bool> only-unadded: false;
+    /// 「重新开始」已进入待确认状态：4 秒内再点一次才真正重跑整批
+    in-out property <bool> restart-armed: false;
     in property <string> node-empty-hint;
     /// 有文件正悬停在窗口上（由 Rust 侧 OLE DragEnter/DragLeave 驱动）
     in-out property <bool> drag-hover: false;
     /// 最右侧日志列宽度
     property <length> log-col-width: 360px;
+
+    // 日志跟随：有新日志时把日志视图贴到最底部（超出范围由 Flickable 自行夹紧）
+    changed log-text => {
+        if (follow-log) {
+            log-sv.content-y = min(0px, log-sv.visible-height - log-sv.content-height);
+        }
+    }
+    // 重新打开「跟随」时立刻跳回底部
+    changed follow-log => {
+        if (follow-log) {
+            log-sv.content-y = min(0px, log-sv.visible-height - log-sv.content-height);
+        }
+    }
+
+    // 「重新开始」的确认窗口：点亮后 4 秒内没再点一次，就自动退回原状
+    restart-timer := Timer {
+        interval: 4s;
+        running: false;
+        triggered => {
+            root.restart-armed = false;
+            restart-timer.running = false;
+        }
+    }
 
     callback add-files();
     callback drop-transfer(data: data-transfer);
@@ -397,6 +573,7 @@ export component AppWindow inherits Window {
     callback filter-changed(int);
     callback toggle-unadded();
     callback clear-finished();
+    callback restart-all();
     callback start-all();
     callback pause-all();
     callback cancel-all();
@@ -404,7 +581,6 @@ export component AppWindow inherits Window {
     callback task-up(string);
     callback task-down(string);
     callback export-log();
-    callback houdini-changed(int);
     callback concurrency-changed(int);
     callback retry-changed(int);
     callback select-all(bool);
@@ -434,6 +610,7 @@ export component AppWindow inherits Window {
                 width: root.width - 26px;
                 height: 40px;
                 VerticalLayout {
+                    alignment: center;
                     HorizontalLayout {
                         spacing: 8px;
 
@@ -469,44 +646,57 @@ export component AppWindow inherits Window {
                             Tag { text: "LOCAL · 本机后台"; }
                         }
 
-                        Text {
-                            text: root.status-text;
-                            font-size: Fonts.size(11px);
-                            color: Theme.text-3;
-                            vertical-alignment: center;
-                            vertical-stretch: 0;
+                        // 运行状态：一盏小灯 + 一句描述，一眼看清队列在干什么。
+                        // 灯和文字装在同一个盒子里各自居中，避免各自被布局顶到不同高度
+                        Rectangle {
+                            width: 12px + status-txt.preferred-width;
+                            height: Fonts.size(13px) + 6px;
+                            Rectangle {
+                                x: 0;
+                                y: (parent.height - 6px) / 2;
+                                width: 6px;
+                                height: 6px;
+                                border-radius: 3px;
+                                background: Tone.fg(root.status-tone);
+                            }
+                            status-txt := Text {
+                                x: 12px;
+                                y: (parent.height - self.height) / 2;
+                                text: root.status-text;
+                                font-size: Fonts.size(11px);
+                                color: root.status-tone == 0 ? Theme.text-3 : Theme.text-2;
+                                vertical-alignment: center;
+                            }
                         }
 
                         Rectangle { horizontal-stretch: 1; }
 
-                        Tag { text: "默认版本"; }
-                        ComboBox {
-                            model: root.houdini-versions;
-                            current-index <=> root.houdini-index;
-                            width: 122px;
-                            selected(v) => { root.houdini-changed(root.houdini-index); }
-                        }
-                        VRule { }
+                        // 作业参数（并发 / 重试），与右侧按钮同宽同高
                         Tag { text: "并发"; }
-                        ComboBox {
-                            model: root.concurrency-options;
-                            current-index <=> root.concurrency-index;
-                            width: 56px;
-                            selected(v) => { root.concurrency-changed(root.concurrency-index); }
+                        MiniSel {
+                            w: 64px;
+                            options: root.concurrency-options;
+                            index <=> root.concurrency-index;
+                            picked(v) => { root.concurrency-changed(root.concurrency-index); }
                         }
+                        // 两组参数之间留一道呼吸缝，免得「并发 1 重试 2 次」读成一串
+                        Rectangle { width: 8px; height: 1px; }
                         Tag { text: "重试"; }
-                        ComboBox {
-                            model: root.retry-options;
-                            current-index <=> root.retry-index;
-                            width: 78px;
-                            selected(v) => { root.retry-changed(root.retry-index); }
+                        MiniSel {
+                            w: 64px;
+                            options: root.retry-options;
+                            index <=> root.retry-index;
+                            picked(v) => { root.retry-changed(root.retry-index); }
                         }
                         VRule { }
-                        TBtn { label: "开始"; kind: 1; w: 54px; clicked => { root.start-all(); } }
-                        TBtn { label: "暂停"; w: 50px; clicked => { root.pause-all(); } }
-                        TBtn { label: "取消"; kind: 3; w: 50px; clicked => { root.cancel-all(); } }
+                        // 队列操作：三个按钮等宽，主操作用实心琥珀
+                        TBtn { label: "开始"; kind: 1; w: 64px; clicked => { root.start-all(); } }
+                        TBtn { label: "暂停"; w: 64px; clicked => { root.pause-all(); } }
+                        TBtn { label: "取消"; kind: 3; w: 64px; clicked => { root.cancel-all(); } }
                         VRule { }
-                        TBtn { label: "字体"; w: 44px; clicked => { root.font-panel-open = true; } }
+                        // 外观
+                        TBtn { label: "字体"; w: 46px; clicked => { root.font-panel-open = true; } }
+                        Rectangle { width: 4px; height: 1px; }
                         ThemeSwitch {
                             on: Theme.dark;
                             toggled => { root.toggle-theme(); }
@@ -545,7 +735,10 @@ export component AppWindow inherits Window {
                                 for shot[i] in root.shots: card := Rectangle {
                                     // hover 判定要把删除按钮自己算进去，否则鼠标移到 × 上会闪
                                     property <bool> hot: row-ta.has-hover || del-ta.has-hover;
-                                    height: 46px;
+                                    // 高度按三行文字实际撑开（字号倍率 115%~145% 时 46px 装不下，
+                                    // 文字会溢出卡片压到下一张上），再夹一层 clip 兜底
+                                    height: Math.max(46px, card-lay.preferred-height);
+                                    clip: true;
                                     border-radius: 6px;
                                     background: i == root.current-shot ? Theme.accent-soft
                                               : (card.hot ? Theme.hover : transparent);
@@ -557,14 +750,14 @@ export component AppWindow inherits Window {
                                     // 选中时的琥珀导条
                                     Rectangle {
                                         x: 0;
-                                        y: 11px;
+                                        y: (parent.height - 24px) / 2;
                                         width: 2px;
                                         height: 24px;
                                         border-radius: 1px;
                                         background: Theme.accent;
                                         opacity: i == root.current-shot ? 1 : 0;
                                     }
-                                    VerticalLayout {
+                                    card-lay := VerticalLayout {
                                         width: parent.width;
                                         padding-top: 4px;
                                         padding-bottom: 4px;
@@ -585,7 +778,7 @@ export component AppWindow inherits Window {
                                     // 状态点：悬停时让位给删除按钮
                                     Rectangle {
                                         x: parent.width - 11px;
-                                        y: 19px;
+                                        y: (parent.height - 5px) / 2;
                                         width: 5px;
                                         height: 5px;
                                         border-radius: 2.5px;
@@ -595,7 +788,7 @@ export component AppWindow inherits Window {
                                     // 删除该工程（连同它在执行区里的任务）
                                     del := Rectangle {
                                         x: parent.width - 23px;
-                                        y: 13px;
+                                        y: (parent.height - 17px) / 2;
                                         width: 17px;
                                         height: 17px;
                                         border-radius: 4px;
@@ -698,7 +891,7 @@ export component AppWindow inherits Window {
                             padding-left: 8px;
                             padding-right: 8px;
                             Rectangle { width: 24px; }
-                            Tag { text: "NODE / OUTPUT"; horizontal-stretch: 1; }
+                            Tag { text: "NODE"; horizontal-stretch: 1; }
                             Tag { text: "类型"; width: 108px; }
                             Tag { text: "分类"; width: 44px; }
                             Tag { text: "帧范围"; width: 100px; }
@@ -706,13 +899,20 @@ export component AppWindow inherits Window {
                         }
                         Rule { }
 
-                        nodes-sv := ScrollView {
-                            VerticalLayout {
-                                width: root.width - 26px - 202px - 298px - root.log-col-width - 45px;
-                                spacing: 0px;
+                        // 节点表：ListView 只实例化看得见的那几行。之前用 ScrollView 装
+                        // VerticalLayout，几千个节点时点一下勾选会整表重建，界面卡 0.7 秒
+                        Rectangle {
+                            vertical-stretch: 1;
+                            nodes-lv := ListView {
+                                x: 0;
+                                y: 0;
+                                width: parent.width;
+                                height: parent.height;
+                                visible: root.nodes.length > 0;
                                 for node[i] in root.nodes: Rectangle {
-                                    width: parent.width;
-                                    height: 34px;
+                                    width: nodes-lv.visible-width;
+                                    // 单行显示：高度跟着字号走，避免大字号下压到下一行
+                                    height: Math.max(26px, Fonts.size(12px) + 13px);
                                     background: node-ta.has-hover ? Theme.hover : (Math.mod(i, 2) == 1 ? Theme.row-alt : transparent);
                                     // 悬停层在最底层，勾选框和帧范围输入框才收得到点击；
                                     // 点行内任意空白处也切换勾选，省得非要去点小方框
@@ -729,23 +929,14 @@ export component AppWindow inherits Window {
                                             on: node.checked;
                                             toggled => { root.toggle-node(i); }
                                         }
-                                        VerticalLayout {
+                                        Text {
+                                            text: node.path;
                                             horizontal-stretch: 1;
-                                            alignment: center;
-                                            spacing: 0px;
-                                            Text {
-                                                text: node.path;
-                                                font-size: Fonts.size(12px);
-                                                color: node.checked ? Theme.text : Theme.text-2;
-                                                overflow: elide;
-                                            }
-                                            Text {
-                                                text: node.output;
-                                                font-family: Fonts.mono;
-                                                font-size: Fonts.size(10px);
-                                                color: Theme.text-3;
-                                                overflow: elide;
-                                            }
+                                            font-size: Fonts.size(12px);
+                                            font-weight: 600;
+                                            color: node.checked ? Theme.text : Theme.text-2;
+                                            vertical-alignment: center;
+                                            overflow: elide;
                                         }
                                         Text {
                                             text: node.ntype;
@@ -756,33 +947,47 @@ export component AppWindow inherits Window {
                                             vertical-alignment: center;
                                             overflow: elide;
                                         }
-                                        Badge {
-                                            label: node.category;
-                                            w: 42px;
-                                            tone: node.category == "渲染" ? 4 : 5;
+                                        // 定高的小控件在行布局里默认贴顶，各包一层竖直居中的容器，
+                                        // 宽度与列头保持一致，列才不会错位
+                                        VerticalLayout {
+                                            width: 44px;
+                                            alignment: center;
+                                            Badge {
+                                                label: node.category;
+                                                w: 42px;
+                                                tone: node.category == "渲染" ? 4 : 5;
+                                            }
                                         }
-                                        Field {
-                                            w: 100px;
-                                            h: 20px;
-                                            centered: true;
-                                            text: node.range;
-                                            edited(t) => { root.range-edited(i, t); }
+                                        VerticalLayout {
+                                            width: 100px;
+                                            alignment: center;
+                                            Field {
+                                                w: 100px;
+                                                h: 20px;
+                                                centered: true;
+                                                text: node.range;
+                                                edited(t) => { root.range-edited(i, t); }
+                                            }
                                         }
-                                        Badge {
-                                            label: node.status;
-                                            w: 60px;
-                                            tone: node.tone;
+                                        VerticalLayout {
+                                            width: 60px;
+                                            alignment: center;
+                                            Badge {
+                                                label: node.status;
+                                                w: 60px;
+                                                tone: node.tone;
+                                            }
                                         }
                                     }
                                 }
-                                if root.nodes.length == 0 : Text {
-                                    text: root.node-empty-hint;
-                                    font-size: Fonts.size(11px);
-                                    color: Theme.text-3;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                    height: 90px;
-                                }
+                            }
+                            if root.nodes.length == 0 : Text {
+                                text: root.node-empty-hint;
+                                font-size: Fonts.size(11px);
+                                color: Theme.text-3;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                height: 90px;
                             }
                         }
                     }
@@ -803,6 +1008,24 @@ export component AppWindow inherits Window {
                             Tag { text: root.queue-count; tint: Theme.text-2; }
                             Rectangle { horizontal-stretch: 1; }
                             Chip { label: "清空完成"; w: 58px; clicked => { root.clear-finished(); } }
+                            // 重新开始：清零所有帧进度并重跑整批。误触代价高（会重渲所有帧），
+                            // 所以做成两步：先点亮成「确认重跑」，4 秒内再点一次才执行
+                            Rectangle { width: 2px; height: 1px; }
+                            Chip {
+                                label: root.restart-armed ? "确认重跑" : "重新开始";
+                                w: 66px;
+                                active: root.restart-armed;
+                                clicked => {
+                                    if (root.restart-armed) {
+                                        root.restart-armed = false;
+                                        restart-timer.running = false;
+                                        root.restart-all();
+                                    } else {
+                                        root.restart-armed = true;
+                                        restart-timer.running = true;
+                                    }
+                                }
+                            }
                         }
                         Rule { }
                         queue-sv := ScrollView {
@@ -810,7 +1033,9 @@ export component AppWindow inherits Window {
                                 width: 280px;
                                 spacing: 5px;
                                 for t[i] in root.queue: Rectangle {
-                                    height: 50px;
+                                    // 同左栏：高度跟内容走，大字号下不会压到下一张卡片
+                                    height: Math.max(50px, q-lay.preferred-height);
+                                    clip: true;
                                     border-radius: 7px;
                                     background: t.tone == 1 ? Theme.run-soft : (card-ta.has-hover ? Theme.hover : Theme.well);
                                     border-width: 1px;
@@ -819,7 +1044,7 @@ export component AppWindow inherits Window {
                                                 : t.tone == 2 ? Theme.ok-line
                                                 : Theme.border;
                                     card-ta := TouchArea { }
-                                    VerticalLayout {
+                                    q-lay := VerticalLayout {
                                         width: parent.width;
                                         padding-top: 6px;
                                         padding-bottom: 6px;
@@ -837,8 +1062,9 @@ export component AppWindow inherits Window {
                                                 overflow: elide;
                                                 vertical-alignment: center;
                                             }
-                                            IconBtn { glyph: "↑"; clicked => { root.task-up(t.nid); } }
-                                            IconBtn { glyph: "↓"; clicked => { root.task-down(t.nid); } }
+                                            // 排序箭头：到顶/到底时置灰
+                                            ArrowBtn { dir-up: true; can-move: i > 0; clicked => { root.task-up(t.nid); } }
+                                            ArrowBtn { dir-up: false; can-move: i + 1 < root.queue.length; clicked => { root.task-down(t.nid); } }
                                             IconBtn { glyph: "×"; kind: 1; clicked => { root.task-cancel(t.nid); } }
                                             Badge { label: t.status; w: 42px; tone: t.tone; }
                                         }
@@ -905,15 +1131,51 @@ export component AppWindow inherits Window {
                                     padding-right: 11px;
                                     alignment: start;
                                     Text {
+                                        width: 100%;
                                         text: root.log-text;
                                         font-size: Fonts.size(10.5px);
                                         color: Theme.dark ? #a8a49b : #55534e;
                                         font-family: Fonts.mono;
                                         wrap: word-wrap;
+                                        horizontal-alignment: left;
+                                        vertical-alignment: top;
                                     }
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // ── 底部状态栏 ──
+            Rectangle {
+                width: root.width - 26px;
+                height: 24px;
+                border-radius: 6px;
+                background: Theme.panel;
+                border-width: 1px;
+                border-color: Theme.border;
+                HorizontalLayout {
+                    padding-left: 9px;
+                    padding-right: 9px;
+                    spacing: 8px;
+                    Tag { text: "HIP"; }
+                    Text {
+                        text: root.status-hip == "" ? "未选择工程 · 拖入 hip 文件开始" : root.status-hip;
+                        horizontal-stretch: 1;
+                        font-family: Fonts.mono;
+                        font-size: Fonts.size(10.5px);
+                        color: root.status-hip == "" ? Theme.text-3 : Theme.text-2;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    VRule { }
+                    Text {
+                        text: root.status-meta;
+                        font-family: Fonts.mono;
+                        font-size: Fonts.size(10.5px);
+                        color: Theme.text-3;
+                        vertical-alignment: center;
                     }
                 }
             }

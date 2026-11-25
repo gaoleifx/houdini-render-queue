@@ -66,13 +66,15 @@ impl JobStatus {
             JobStatus::Canceled => "canceled",
         }
     }
+    /// 同时认库里的英文键（queued/success…）和界面快照里的中文标签（排队/成功…）：
+    /// 快照里 status 存的是 label()，只按英文匹配会一律落到 Queued
     pub fn parse(s: &str) -> JobStatus {
         match s {
-            "running" => JobStatus::Running,
-            "success" => JobStatus::Success,
-            "failed" => JobStatus::Failed,
-            "skipped" => JobStatus::Skipped,
-            "canceled" => JobStatus::Canceled,
+            "running" | "执行中" => JobStatus::Running,
+            "success" | "成功" => JobStatus::Success,
+            "failed" | "失败" => JobStatus::Failed,
+            "skipped" | "跳过" => JobStatus::Skipped,
+            "canceled" | "取消" => JobStatus::Canceled,
             _ => JobStatus::Queued,
         }
     }

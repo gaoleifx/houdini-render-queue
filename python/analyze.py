@@ -32,11 +32,15 @@ RENDER_TYPES = {
     # Houdini 20.5+ 的 USDRender ROP：真正跑 husk 渲染的那个节点
     "usdrender_rop", "usdrenderrop",
 }
-# 缓存类节点类型名
+# 缓存类节点类型名：只认真正往磁盘写序列的输出节点。
+# 注意不要收裸的 "alembic"——那是 SOP 里的 Alembic 导入节点，只是读别人的 abc，
+# 列进来会让人误以为要重新缓存；真正导出 abc 的是 /out 下的 rop_alembic。
 CACHE_TYPES = {
-    "rop_geometry", "alembic", "rop_alembic", "filecache", "filecache::2.0",
+    "rop_geometry", "rop_alembic", "filecache", "filecache::2.0",
     "rop_usd", "usd_rop", "rop_fbx", "rop_gltf", "rop_bgeo", "geometry",
 }
+# 带版本后缀的类型名（filecache::2.0、rop_geometry::3.0 之类）用前缀兜底
+CACHE_TYPE_PREFIXES = ("filecache", "rop_geometry", "rop_alembic")
 # 这类节点只是配置（输出路径写在参数上），单独执行没有意义，不进列表
 SKIP_TYPE_HINTS = ("settings", "materiallibrary", "lightmixer")
 # 输出路径参数候选（按优先级）
@@ -134,7 +138,7 @@ def classify(node):
         return None
     if tname in RENDER_TYPES:
         return "render"
-    if tname in CACHE_TYPES:
+    if tname in CACHE_TYPES or tname.startswith(CACHE_TYPE_PREFIXES):
         return "cache"
     # 启发式：看参数里有没有图像类输出
     pname, pval = get_output_parm(node)
@@ -172,11 +176,11 @@ def collect_from(container_path, glb, out, seen, sop_mode=False):
         except Exception:
             pass
         # SOP 网络里只认类型名白名单中的缓存/渲染节点，不走参数启发式，
-        # 否则 file1/box/null 这类普通 SOP 会因为 filename 参数被误判为缓存
+        # 否则 file1/box/null/alembic 这类普通 SOP 会因为 filename 参数被误判为缓存
         if sop_mode:
-            exact = tname in CACHE_TYPES or tname in RENDER_TYPES
-            if not exact and not any(tname.startswith(h) for h in
-                                     ("filecache", "alembic", "rop_geometry")):
+            exact = (tname in CACHE_TYPES or tname in RENDER_TYPES
+                     or tname.startswith(CACHE_TYPE_PREFIXES))
+            if not exact:
                 continue
         cat = classify(n)
         if cat is None:

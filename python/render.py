@@ -103,6 +103,27 @@ def preflight(node, fstart):
     return True, None
 
 
+def disable_loadfromdisk(node):
+    """把 SOP 缓存节点的「Load From Disk」关掉，返回是否真的改过。
+
+    File Cache SOP（filecache::2.0）开着 Load From Disk 时，cook 出来的不是
+    上游算出来的几何，而是「去磁盘读缓存文件」：新版本目录里还没有文件，读到的
+    就是空几何。这时拿 geometry ROP 去「渲染」它，等于把空的 902 字节 bgeo
+    写回缓存路径，整段缓存全是 0 点——正是「缓存出来都是空的」的原因。
+    所以真正写缓存之前必须先关掉它，让节点去跑上游。
+    """
+    p = node.parm("loadfromdisk")
+    if p is None:
+        return False
+    try:
+        if not p.eval():
+            return False
+        p.set(0)
+        return True
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("hip")
@@ -150,6 +171,13 @@ def main():
         emit("##PREFLIGHT", reason)
         return 2
 
+    # SOP 缓存节点：cook 之前先关掉 Load From Disk，否则节点不会去跑上游，
+    # 只会读磁盘上已有的缓存（新版本目录里还没有文件 → 空几何），
+    # 代理 ROP 再把这份空几何写回缓存路径，整段缓存都是 0 点。只改内存，不存 hip。
+    if isinstance(node, hou.SopNode) and disable_loadfromdisk(node):
+        emit("##NOTE",
+             "节点原本是 Load From Disk 状态，已临时关闭后再缓存：%s" % node.path())
+
     # SOP 缓存节点（如 filecache::2.0）没有 render()，需要借一个临时
     # geometry ROP 指向它逐帧写盘；ROP/LOP 节点照旧直接 render()
     is_sop_cache = False
@@ -191,6 +219,7 @@ def main():
             return 3
 
     canceled = False
+    sizes = []
     for f in frames:
         if args.cancel and os.path.exists(args.cancel):
             canceled = True
@@ -208,11 +237,26 @@ def main():
             traceback.print_exc()
             emit("##FAIL", "帧 %d 渲染失败: %s" % (f, e))
             return 3
+        if proxy is not None:
+            # 记下这一帧真实写出来的文件大小，用来兜住「写出一堆空几何」的情况
+            try:
+                outp = proxy.parm("sopoutput").evalAsString()
+                sizes.append(os.path.getsize(outp) if os.path.exists(outp) else -1)
+            except Exception:
+                pass
         emit("##DONE", f)
 
     if canceled:
         emit("##CANCELED")
         return 4
+
+    # 空的 bgeo.sc 约 900 字节。整段缓存全都这么小，等于什么都没缓存出来，
+    # 与其报「完成」让人后面渲染才发现没东西，不如当成失败喊出来。
+    if proxy is not None and len(sizes) >= 2 and all(0 <= s < 1024 for s in sizes):
+        emit("##FAIL",
+             "全部 %d 帧的输出都小于 1KB，缓存内容是空的（请检查该节点上游"
+             "是否有解算/几何数据，或 Load From Disk 是否仍未关闭）" % len(sizes))
+        return 3
 
     emit("##FINISH")
     return 0

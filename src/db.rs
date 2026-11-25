@@ -202,6 +202,44 @@ impl Db {
         );
     }
 
+    /// 批量落库：一次事务写完。逐个 save_job 各自提交时，几千个任务要等好几秒
+    pub fn save_jobs(&self, jobs: &[(&JobSpec, i64, JobStatus, u32)]) {
+        if jobs.is_empty() {
+            return;
+        }
+        let Ok(tx) = self.conn.unchecked_transaction() else {
+            return;
+        };
+        for (spec, ord, status, attempts) in jobs {
+            let _ = tx.execute(
+                "INSERT INTO jobs (id, ord, project_key, hip, hython, houdini, shot, node_path,
+                                   node_type, category, output, fstart, fend, status, attempts)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                 ON CONFLICT(id) DO UPDATE SET
+                    ord=excluded.ord, status=excluded.status, attempts=excluded.attempts,
+                    fstart=excluded.fstart, fend=excluded.fend",
+                params![
+                    spec.id,
+                    ord,
+                    spec.project_key,
+                    spec.hip.to_string_lossy(),
+                    spec.hython.to_string_lossy(),
+                    spec.houdini,
+                    spec.shot,
+                    spec.node_path,
+                    spec.node_type,
+                    spec.category.as_str(),
+                    spec.output,
+                    spec.fstart,
+                    spec.fend,
+                    status.as_str(),
+                    attempts
+                ],
+            );
+        }
+        let _ = tx.commit();
+    }
+
     pub fn delete_job(&self, id: &str) {
         let _ = self.conn.execute("DELETE FROM jobs WHERE id=?1", params![id]);
         let _ = self

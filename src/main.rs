@@ -1,3 +1,7 @@
+// release 构建使用 Windows 图形子系统，双击运行不再弹出黑色控制台窗口；
+// debug 构建仍保留控制台，方便查看 eprintln 调试日志。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 slint::include_modules!();
 
 mod analyze;
@@ -24,12 +28,15 @@ use db::Db;
 use model::*;
 use queue::{Cmd, Engine};
 
+
 // ───────────────────────── 应用状态 ─────────────────────────
 
 struct App {
     projects: Vec<Project>,
     /// 当前中栏展示的节点索引 (项目下标, 节点下标)
     visible: Vec<(usize, usize)>,
+    /// 节点表的模型本身（界面共用这一份）：勾选只改对应行，不重建整个列表
+    node_rows: Rc<VecModel<OutNode>>,
     /// 执行区的任务定义（顺序即执行顺序）
     jobs: Vec<JobSpec>,
     /// 引擎回推的任务快照
@@ -180,14 +187,117 @@ fn resolve_install(
     }
 }
 
+/// 单个节点在当前筛选/入队状态下的列表行；不满足筛选条件时返回 None。
+/// needle 是已小写化的搜索词，循环里不要重复 to_lowercase。
+fn node_row(app: &App, needle: &str, pi: usize, ni: usize) -> Option<OutNode> {
+    let project = app.projects.get(pi)?;
+    let n = project.nodes.get(ni)?;
+    let cat = n.cat();
+    if app.filter == 1 && cat != Category::Cache {
+        return None;
+    }
+    if app.filter == 2 && cat != Category::Render {
+        return None;
+    }
+    if !needle.is_empty() {
+        let hay = format!(
+            "{} {} {}",
+            n.path,
+            n.ntype,
+            n.output.clone().unwrap_or_default()
+        )
+        .to_lowercase();
+        if !hay.contains(needle) {
+            return None;
+        }
+    }
+    let id = job_id(&project.key, &n.path);
+    let status = app.queued.get(&id).copied();
+    if app.only_unadded && status.is_some() {
+        return None;
+    }
+    let (a, b) = app
+        .ranges
+        .get(&id)
+        .copied()
+        .unwrap_or_else(|| default_range(project, n));
+    Some(OutNode {
+        checked: status.is_some(),
+        path: n.path.clone().into(),
+        ntype: n.ntype.clone().into(),
+        category: cat.label().into(),
+        output: n
+            .output
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "—".into())
+            .into(),
+        range: format!("{a}-{b}").into(),
+        status: status.map(|s| s.label()).unwrap_or("未加入").into(),
+        tone: status.map(|s| s.tone()).unwrap_or(0),
+    })
+}
+
+/// 只改状态真变了的那几行：勾选 / 队列回推时不要再重建整张表
+fn refresh_row(app: &App, idx: usize) {
+    let Some(&(pi, ni)) = app.visible.get(idx) else {
+        return;
+    };
+    let needle = app.search.to_lowercase();
+    let Some(row) = node_row(app, &needle, pi, ni) else {
+        return;
+    };
+    let same = app
+        .node_rows
+        .row_data(idx)
+        .map(|cur| {
+            cur.checked == row.checked
+                && cur.status == row.status
+                && cur.tone == row.tone
+                && cur.range == row.range
+        })
+        .unwrap_or(false);
+    if !same {
+        app.node_rows.set_row_data(idx, row);
+    }
+}
+
+/// 队列状态变化后逐行对齐（行的集合不变时用这个，别整表重建）
+fn refresh_rows(app: &App) {
+    let needle = app.search.to_lowercase();
+    for idx in 0..app.visible.len() {
+        let Some(&(pi, ni)) = app.visible.get(idx) else {
+            continue;
+        };
+        let Some(row) = node_row(app, &needle, pi, ni) else {
+            continue;
+        };
+        let same = app
+            .node_rows
+            .row_data(idx)
+            .map(|cur| {
+                cur.checked == row.checked
+                    && cur.status == row.status
+                    && cur.tone == row.tone
+                    && cur.range == row.range
+            })
+            .unwrap_or(false);
+        if !same {
+            app.node_rows.set_row_data(idx, row);
+        }
+    }
+}
+
 fn rebuild_nodes(ui: &AppWindow, app: &mut App) {
     let cur = (ui.get_current_shot().max(0) as usize).min(app.projects.len().saturating_sub(1));
     app.visible.clear();
 
     let Some(project) = app.projects.get(cur).cloned() else {
-        ui.set_nodes(ModelRc::new(VecModel::from(Vec::<OutNode>::new())));
+        app.node_rows.set_vec(Vec::<OutNode>::new());
         ui.set_shot_title("输出节点".into());
         ui.set_node_empty_hint("还没有导入工程".into());
+        ui.set_status_hip("".into());
+        ui.set_status_meta("".into());
         ui.set_version_options(ModelRc::new(VecModel::from(
             Vec::<slint::SharedString>::new(),
         )));
@@ -202,47 +312,15 @@ fn rebuild_nodes(ui: &AppWindow, app: &mut App) {
 
     let needle = app.search.to_lowercase();
     let mut rows: Vec<OutNode> = Vec::new();
-    for (ni, n) in project.nodes.iter().enumerate() {
-        let cat = n.cat();
-        if app.filter == 1 && cat != Category::Cache {
-            continue;
+    let mut hits: Vec<(usize, OutNode)> = Vec::new();
+    for ni in 0..project.nodes.len() {
+        if let Some(row) = node_row(app, &needle, cur, ni) {
+            hits.push((ni, row));
         }
-        if app.filter == 2 && cat != Category::Render {
-            continue;
-        }
-        if !needle.is_empty() {
-            let hay = format!("{} {} {}", n.path, n.ntype, n.output.clone().unwrap_or_default())
-                .to_lowercase();
-            if !hay.contains(&needle) {
-                continue;
-            }
-        }
-        let id = job_id(&project.key, &n.path);
-        let status = app.queued.get(&id).copied();
-        if app.only_unadded && status.is_some() {
-            continue;
-        }
-        let (a, b) = app
-            .ranges
-            .get(&id)
-            .copied()
-            .unwrap_or_else(|| default_range(&project, n));
+    }
+    for (ni, row) in hits {
         app.visible.push((cur, ni));
-        rows.push(OutNode {
-            checked: status.is_some(),
-            path: n.path.clone().into(),
-            ntype: n.ntype.clone().into(),
-            category: cat.label().into(),
-            output: n
-                .output
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "—".into())
-                .into(),
-            range: format!("{a}-{b}").into(),
-            status: status.map(|s| s.label()).unwrap_or("未加入").into(),
-            tone: status.map(|s| s.tone()).unwrap_or(0),
-        });
+        rows.push(row);
     }
 
     let title = if project.loading {
@@ -251,7 +329,27 @@ fn rebuild_nodes(ui: &AppWindow, app: &mut App) {
         format!("{} · 输出节点 {}", project.shot, project.nodes.len())
     };
     ui.set_shot_title(title.into());
-    ui.set_nodes(ModelRc::new(VecModel::from(rows)));
+    app.node_rows.set_vec(rows);
+
+    // 底部状态栏：完整 hip 路径 + 版本/节点统计
+    let caches = project
+        .nodes
+        .iter()
+        .filter(|n| n.cat() == Category::Cache)
+        .count();
+    let meta = if project.loading {
+        format!("v{} · 解析中…", project.houdini)
+    } else {
+        format!(
+            "v{} · 节点 {}（缓存 {} / 渲染 {}）",
+            project.houdini,
+            project.nodes.len(),
+            caches,
+            project.nodes.len() - caches
+        )
+    };
+    ui.set_status_hip(project.hip.display().to_string().into());
+    ui.set_status_meta(meta.into());
     let hint: String = if project.loading {
         "正在用 hython 解析工程，请稍候…".into()
     } else if let Some(e) = &project.error {
@@ -308,18 +406,21 @@ fn rebuild_queue(ui: &AppWindow, app: &App) {
         .iter()
         .filter(|v| v.status == JobStatus::Failed.label())
         .count();
-    let mut st = if running > 0 {
-        format!("运行中 · {} 执行 / {} 排队", running, queued)
+    let (mut st, mut tone) = if running > 0 {
+        (format!("运行中 · {} 执行 / {} 排队", running, queued), 1)
     } else if queued > 0 {
         // 只是排队、还没点开始，不该写「运行中」
-        format!("待执行 · {} 排队", queued)
+        (format!("待执行 · {} 排队", queued), 4)
     } else {
-        "空闲".to_string()
+        ("空闲".to_string(), 0)
     };
     if failed > 0 {
         st.push_str(&format!(" · {} 失败", failed));
+        tone = 3;
     }
     ui.set_status_text(st.into());
+    // 顶栏状态灯跟着走：灰=空闲，蓝=运行，琥珀=待执行，红=有失败
+    ui.set_status_tone(tone);
 }
 
 fn signature(views: &[JobView]) -> String {
@@ -430,7 +531,12 @@ fn toggle_node(ui: &AppWindow, app: &mut App, idx: usize) {
         insert_job(app, spec);
     }
     sync_jobs(app);
-    rebuild_nodes(ui, app);
+    // 「只看未加入」下勾选会让这一行消失，只能整表重建；平时只刷这一行
+    if app.only_unadded {
+        rebuild_nodes(ui, app);
+    } else {
+        refresh_row(app, idx);
+    }
 }
 
 fn select_all(ui: &AppWindow, app: &mut App, on: bool) {
@@ -526,7 +632,12 @@ fn edit_range(ui: &AppWindow, app: &mut App, idx: usize, text: String) {
         sync_jobs(app);
     }
     save_ranges(app);
-    rebuild_nodes(ui, app);
+    // 生效后只刷这一行（输入框里的文字不用被模型覆盖回去）
+    if app.only_unadded {
+        rebuild_nodes(ui, app);
+    } else {
+        refresh_row(app, idx);
+    }
 }
 
 fn parse_range(s: &str) -> Option<(i32, i32)> {
@@ -891,12 +1002,6 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
 
     let installs = houdini::detect_installs();
-    let vers: Vec<slint::SharedString> = if installs.is_empty() {
-        vec!["未找到 Houdini".into()]
-    } else {
-        installs.iter().map(|i| i.version.clone().into()).collect()
-    };
-    ui.set_houdini_versions(ModelRc::new(VecModel::from(vers)));
 
     let ui_db = Db::open().unwrap_or_else(|e| {
         eprintln!("数据库不可用: {e}");
@@ -940,6 +1045,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let app = Rc::new(RefCell::new(App {
         projects,
         visible: Vec::new(),
+        node_rows: Rc::new(VecModel::from(Vec::<OutNode>::new())),
         jobs,
         views: Vec::new(),
         queued: HashMap::new(),
@@ -973,6 +1079,8 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let mut a = app.borrow_mut();
         rebuild_shots(&ui, &a);
+        // 节点表界面和 Rust 侧共用同一份模型，之后只改行不换模型
+        ui.set_nodes(ModelRc::from(a.node_rows.clone()));
         rebuild_nodes(&ui, &mut a);
         rebuild_queue(&ui, &a);
         flush_log(&ui, &mut a);
@@ -1237,20 +1345,41 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_clear_finished(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let mut a = app.borrow_mut();
-            a.engine.send(Cmd::ClearFinished);
-            // 完成的任务从本地列表里也摘掉（引擎会重推快照）
-            let finished: Vec<String> = a
+            // 以引擎推回来的快照为准：把已结束（完成/失败/跳过/取消）的任务
+            // 同时从本地任务表里摘掉，再整体下发给引擎。
+            // 之前只摘本地列表、不发 SetJobs，引擎那边还留着这些任务，
+            // 界面上看不出任何变化 —— 这就是「清空完成」点了没反应的原因。
+            let finished: std::collections::HashSet<String> = a
                 .views
                 .iter()
-                .filter(|v| {
-                    v.status == JobStatus::Success.label()
-                        || v.status == JobStatus::Failed.label()
-                        || v.status == JobStatus::Skipped.label()
-                        || v.status == JobStatus::Canceled.label()
-                })
+                .filter(|v| JobStatus::parse(&v.status).is_finished())
                 .map(|v| v.id.clone())
                 .collect();
+            let before = a.jobs.len();
             a.jobs.retain(|j| !finished.contains(&j.id));
+            let removed = before - a.jobs.len();
+            if removed > 0 {
+                sync_jobs(&a);
+                push_log(&mut a, format!("已清空 {removed} 个已结束的任务"));
+            } else {
+                push_log(&mut a, "执行区里没有已结束的任务".into());
+            }
+            flush_log(&ui, &mut a);
+        });
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_restart_all(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let mut a = app.borrow_mut();
+            if a.jobs.is_empty() {
+                push_log(&mut a, "执行区是空的，没有可重跑的任务".into());
+            } else {
+                // 帧进度、重试次数由引擎一起清掉，清完立刻开始跑
+                a.engine.send(Cmd::RestartAll);
+            }
             flush_log(&ui, &mut a);
         });
     }
@@ -1357,66 +1486,6 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let app = app.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_houdini_changed(move |i| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let mut a = app.borrow_mut();
-            a.hud_index = i.max(0) as usize;
-
-            // 默认版本只兜底两类工程：hip 里没版本记录，或本机没装它的制作版本
-            let mut moved = Vec::new();
-            for k in 0..a.projects.len() {
-                if a.projects[k].pinned {
-                    continue;
-                }
-                let auto = a.projects[k].auto_version.clone();
-                if let Some(v) = auto.as_deref() {
-                    if houdini::match_install(&a.installs, v).is_some() {
-                        continue;
-                    }
-                }
-                let (ti, _) = resolve_install(&a.installs, a.hud_index, auto.as_deref());
-                let Some(ti) = ti else { continue };
-                let inst = a.installs[ti].clone();
-                if a.projects[k].hython != inst.hython {
-                    a.projects[k].hython = inst.hython.clone();
-                    a.projects[k].houdini = inst.version.clone();
-                    let key = a.projects[k].key.clone();
-                    for j in a.jobs.iter_mut().filter(|j| j.project_key == key) {
-                        j.hython = inst.hython.clone();
-                        j.houdini = inst.version.clone();
-                    }
-                    moved.push(a.projects[k].shot.clone());
-                }
-            }
-            if !moved.is_empty() {
-                sync_jobs(&a);
-                for p in &a.projects {
-                    let _ = a.ui_db.save_project(p);
-                }
-                let v = a
-                    .installs
-                    .get(a.hud_index)
-                    .map(|i| i.version.clone())
-                    .unwrap_or_default();
-                push_log(
-                    &mut a,
-                    format!(
-                        "{}  默认 Houdini 改为 {}，{} 个未识别版本的工程已跟随（可点各自「重新解析」刷新节点）",
-                        pyproc::now_hms(),
-                        v,
-                        moved.len()
-                    ),
-                );
-            }
-            rebuild_shots(&ui, &a);
-            rebuild_nodes(&ui, &mut a);
-            flush_log(&ui, &mut a);
-        });
-    }
-
-    {
-        let app = app.clone();
         ui.on_concurrency_changed(move |i| {
             let mut a = app.borrow_mut();
             a.concurrency = (i.max(0) as usize) + 1;
@@ -1467,6 +1536,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let rx = evt_rx;
         let mut drop_tried = false;
         let mut drop_ready = false;
+        // 双击计数器：坐标相同的两次双击也要各自触发一次刷新
+        let mut dbl_tick: i32 = 0;
         // 自检：--drop-test <路径> 会在挂好接收器后自己投一次拖放
         let mut drop_test: Option<PathBuf> = std::env::args()
             .skip_while(|a| a != "--drop-test")
@@ -1474,7 +1545,7 @@ fn main() -> Result<(), slint::PlatformError> {
             .map(PathBuf::from);
         timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_millis(120),
+            Duration::from_millis(50),
             move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
                 let mut a = app.borrow_mut();
@@ -1488,6 +1559,8 @@ fn main() -> Result<(), slint::PlatformError> {
                         drop_ready = rep.ok();
                         // 窗口刚建好，补一次标题栏配色
                         windrop::set_dark_titlebar(hwnd, ui.global::<Theme>().get_dark());
+                        // 大图标（任务栏/Alt+Tab）winit 不管，自己从 exe 资源补上
+                        windrop::set_big_icon(hwnd);
                         if drop_ready {
                             push_log(
                                 &mut a,
@@ -1533,6 +1606,18 @@ fn main() -> Result<(), slint::PlatformError> {
                     add_paths(&ui, &mut a, dropped);
                 }
 
+                // 双击输入框 → 整段选中。TextInput 原生双击只按词选（"1-240" 会被拆成两段），
+                // 所以窗口过程自己数双击，这里把物理坐标折成逻辑像素再喂给界面
+                if let Some((px, py)) = windrop::take_double_click() {
+                    let s = ui.window().scale_factor();
+                    let s = if s > 0.1 { s } else { 1.0 };
+                    let fa = ui.global::<FieldActions>();
+                    fa.set_x((px as f32 / s).round() as i32);
+                    fa.set_y((py as f32 / s).round() as i32);
+                    dbl_tick = dbl_tick.wrapping_add(1);
+                    fa.set_tick(dbl_tick);
+                }
+
                 let mut queue_changed = false;
                 while let Ok(ev) = rx.try_recv() {
                     match ev {
@@ -1549,7 +1634,12 @@ fn main() -> Result<(), slint::PlatformError> {
                             a.last_sig = sig;
                             rebuild_queue(&ui, &a);
                             if node_state_changed {
-                                rebuild_nodes(&ui, &mut a);
+                                // 行集合不变时逐行对齐就够了；几千个节点整表重建会卡住界面
+                                if a.only_unadded {
+                                    rebuild_nodes(&ui, &mut a);
+                                } else {
+                                    refresh_rows(&a);
+                                }
                             }
                         }
                         Event::Analyzed { key, result, logs } => {
@@ -1625,6 +1715,23 @@ fn main() -> Result<(), slint::PlatformError> {
             slint::Timer::single_shot(Duration::from_millis(1500), move || {
                 if let Some(ui) = ui_weak.upgrade() {
                     ui.invoke_toggle_node(i);
+                }
+            });
+        }
+    }
+
+    // 调试用：--debug-invoke clear-finished|restart-all 直接触发一次按钮回调，
+    // 绕开鼠标命中测试，方便用快照做回归
+    if let Some(pos) = std::env::args().position(|a| a == "--debug-invoke") {
+        if let Some(name) = std::env::args().nth(pos + 1) {
+            let ui_weak = ui.as_weak();
+            slint::Timer::single_shot(Duration::from_millis(1500), move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    match name.as_str() {
+                        "clear-finished" => ui.invoke_clear_finished(),
+                        "restart-all" => ui.invoke_restart_all(),
+                        other => eprintln!("未知的调试回调: {other}"),
+                    }
                 }
             });
         }

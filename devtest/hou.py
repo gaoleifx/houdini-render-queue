@@ -92,16 +92,24 @@ class Node:
 def _build():
     geo = Node("/out/geo_cache", "rop_geometry",
                {"sopoutput": "$HIP/geo/cache.$F4.bgeo.sc", "f1": 1, "f2": 12})
-    abc = Node("/out/abc_cache", "alembic",
+    abc = Node("/out/abc_cache", "rop_alembic",
                {"filename": "$HIP/geo/abc.$F4.abc"})
     ifd = Node("/out/mantra_beauty", "ifd",
                {"vm_picture": "$HIP/render/beauty.$F4.exr", "f1": 10, "f2": 16})
     misc = Node("/out/misc_null", "null", {})
     karma = Node("/stage/karma_render", "karma",
                  {"picture": "$HIP/render/karma.$F4.exr"})
+    # /obj 下的 SOP：alembic 是导入节点（不该入列），filecache 才是要缓存的那个
+    obj_geo = Node("/obj/efx_geo", "geo", {}, [
+        Node("/obj/efx_geo/abc_import", "alembic",
+             {"filename": "$HIP/geo/abc.$F4.abc"}),
+        Node("/obj/efx_geo/cache_out", "filecache::2.0",
+             {"sopoutput": "$HIP/geo/efx.$F4.bgeo.sc", "f1": 1, "f2": 8}),
+    ])
     return {
         "/out": Node("/out", "root", {}, [geo, abc, ifd, misc]),
         "/stage": Node("/stage", "root", {}, [karma]),
+        "/obj": Node("/obj", "root", {}, [obj_geo]),
     }
 
 
