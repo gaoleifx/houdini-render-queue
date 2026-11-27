@@ -94,6 +94,8 @@ pub enum Msg {
     },
     /// master → worker：请在该帧结束后停下
     Cancel { job: String, chunk: String },
+    /// master → worker：调整本机并发槽数（设备面板上 +/-）
+    Slots { seq: u64, slots: u32 },
     /// worker → master：这块结束了
     Result {
         job: String,
@@ -101,6 +103,12 @@ pub enum Msg {
         kind: String,
         detail: String,
         code: i32,
+        /// 从起进程到 `##READY` 的耗时。主控用它算「这块切多大才不亏」
+        #[serde(default)]
+        boot_ms: u64,
+        /// 该块平均单帧耗时。同上
+        #[serde(default)]
+        frame_ms: u64,
     },
     /// worker → master：心跳
     Beat {
@@ -147,6 +155,9 @@ pub enum HubEvent {
         host: String,
         kind: DoneKind,
         detail: String,
+        /// 该块实测：加载耗时 / 单帧耗时（0 = 没测到）
+        boot_ms: u64,
+        frame_ms: u64,
     },
     Log(String),
     /// 池子变了（上下线 / 槽位 / 心跳），界面的设备面板要刷
@@ -185,6 +196,8 @@ pub struct WorkerView {
     pub chunk: String,
     pub frame: i32,
     pub mem_mb: u64,
+    /// 被主控停用：连接还在，但不派新活（有人要拿这台机器干别的）
+    pub paused: bool,
 }
 
 /// 一次派发请求（引擎侧填）。
@@ -196,6 +209,8 @@ pub struct AssignReq {
     pub houdini: String,
     pub output: String,
     pub frames: Vec<i32>,
+    /// 本次不要派给这些 worker（刚在这台上失败过）。空 = 不限制。
+    pub exclude: Vec<usize>,
 }
 
 struct Worker {
@@ -207,12 +222,16 @@ struct Worker {
     out: Sender<String>,
     last_beat: Instant,
     online: bool,
+    paused: bool,
     job: String,
     chunk: String,
     frame: i32,
     mem_mb: u64,
     /// 这台机器拒绝过的块（路径不可见 / 版本缺失）。同一个块不再往它身上派。
     rejected: HashSet<String>,
+    /// 已经派出去、还没回报的块。掉线时要把这份交回引擎，否则那些帧
+    /// 既不会完成也不会重派，整个任务永远停在「执行中」。
+    inflight: Vec<(String, String)>,
 }
 
 struct Pool {
@@ -268,10 +287,11 @@ impl Hub {
                         w.online = false;
                         w.busy = 0;
                         changed = true;
+                        let lost = std::mem::take(&mut w.inflight);
                         let _ = tx.send(HubEvent::Offline {
                             worker: w.id,
                             host: w.host.clone(),
-                            running: Vec::new(),
+                            running: lost,
                         });
                         let _ = tx.send(HubEvent::Log(format!(
                             "worker {} 心跳超时，已标记离线",
@@ -352,11 +372,13 @@ impl Hub {
                         out: out_tx.clone(),
                         last_beat: Instant::now(),
                         online: true,
+                        paused: false,
                         job: String::new(),
                         chunk: String::new(),
                         frame: 0,
                         mem_mb: 0,
                         rejected: HashSet::new(),
+                        inflight: Vec::new(),
                     });
                     worker_id = Some(id);
                     let wv = p.workers.last().map(view_of).unwrap_or_default();
@@ -379,11 +401,19 @@ impl Hub {
                     let _ = tx.send(HubEvent::Changed);
                 }
                 Msg::Claim { .. } => {
-                    // 只有空槽才回派：忙的时候等下一轮（worker 也会按 poll_ms 再问）
-                    let mut p = self.pool.lock().unwrap();
-                    if let Some(w) = p.workers.iter_mut().find(|w| Some(w.id) == worker_id) {
+                    // worker 说「我空出来了」。忙数由主控自己记账（派发 +1 / 回报 -1），
+                    // 不采信对端的数字：心跳与派发交叉时，过期的 claim 会把刚派出去的
+                    // 槽位又报成空闲，主控就会往一个 1 槽的机器上压第二块。
+                    if let Some(w) = self
+                        .pool
+                        .lock()
+                        .unwrap()
+                        .workers
+                        .iter_mut()
+                        .find(|w| Some(w.id) == worker_id)
+                    {
                         w.last_beat = Instant::now();
-                        w.busy = w.busy.min(w.slots);
+                        w.online = true;
                     }
                 }
                 Msg::Accept { job, chunk, .. } => {
@@ -398,6 +428,7 @@ impl Hub {
                         w.job.clear();
                         w.chunk.clear();
                         w.rejected.insert(chunk_key(&job, &chunk));
+                        w.inflight.retain(|(j, c)| !(j == &job && c == &chunk));
                     }
                     drop(p);
                     let _ = tx.send(HubEvent::Log(format!(
@@ -411,6 +442,8 @@ impl Hub {
                         host: host.clone(),
                         kind: DoneKind::Fail,
                         detail: format!("{host} 拒绝：{why}"),
+                        boot_ms: 0,
+                        frame_ms: 0,
                     });
                     let _ = tx.send(HubEvent::Changed);
                 }
@@ -443,6 +476,8 @@ impl Hub {
                     kind,
                     detail,
                     code: _,
+                    boot_ms,
+                    frame_ms,
                 } => {
                     let mut p = self.pool.lock().unwrap();
                     if let Some(w) = p.workers.iter_mut().find(|w| Some(w.id) == worker_id) {
@@ -451,6 +486,7 @@ impl Hub {
                         w.chunk.clear();
                         w.frame = 0;
                         w.last_beat = Instant::now();
+                        w.inflight.retain(|(j, c)| !(j == &job && c == &chunk));
                     }
                     drop(p);
                     let _ = tx.send(HubEvent::Done {
@@ -460,11 +496,13 @@ impl Hub {
                         host: host.clone(),
                         kind: DoneKind::parse(&kind),
                         detail,
+                        boot_ms,
+                        frame_ms,
                     });
                     let _ = tx.send(HubEvent::Changed);
                 }
                 Msg::Beat {
-                    busy,
+                    busy: _rep,
                     job,
                     chunk,
                     frame,
@@ -474,7 +512,7 @@ impl Hub {
                     if let Some(w) = p.workers.iter_mut().find(|w| Some(w.id) == worker_id) {
                         w.last_beat = Instant::now();
                         w.online = true;
-                        w.busy = busy.min(w.slots);
+                        // 不用对端报的 busy 覆盖本地记账（见 Claim 处的说明）
                         w.job = job;
                         w.chunk = chunk;
                         w.frame = frame;
@@ -491,10 +529,11 @@ impl Hub {
             if let Some(w) = p.workers.iter_mut().find(|w| w.id == id) {
                 w.online = false;
                 w.busy = 0;
+                let lost = std::mem::take(&mut w.inflight);
                 let _ = tx.send(HubEvent::Offline {
                     worker: id,
                     host: w.host.clone(),
-                    running: Vec::new(),
+                    running: lost,
                 });
                 let _ = tx.send(HubEvent::Log(format!("{} 连接断开", w.host)));
             }
@@ -517,7 +556,12 @@ impl Hub {
         let mut exact: Option<usize> = None;
         let mut loose: Option<usize> = None;
         for (i, w) in p.workers.iter().enumerate() {
-            if !w.online || w.busy >= w.slots || w.rejected.contains(&key) {
+            if !w.online
+                || w.paused
+                || w.busy >= w.slots
+                || w.rejected.contains(&key)
+                || req.exclude.contains(&w.id)
+            {
                 continue;
             }
             if loose.is_none() {
@@ -539,6 +583,7 @@ impl Hub {
         w.busy += 1;
         w.job = req.job.clone();
         w.chunk = req.chunk.clone();
+        w.inflight.push((req.job.clone(), req.chunk.clone()));
         write_msg(
             &w.out,
             &Msg::Assign {
@@ -580,12 +625,12 @@ impl Hub {
         p.workers.iter().map(view_of).collect()
     }
 
-    /// 有空槽的 worker 数（引擎用来决定要不要切块派发）。
+    /// 有空槽的 worker 数（引擎用来决定要不要切块派发）。停用的不算。
     pub fn idle_slots(&self) -> usize {
         let p = self.pool.lock().unwrap();
         p.workers
             .iter()
-            .filter(|w| w.online)
+            .filter(|w| w.online && !w.paused)
             .map(|w| (w.slots.saturating_sub(w.busy)) as usize)
             .sum()
     }
@@ -593,6 +638,27 @@ impl Hub {
     pub fn online_count(&self) -> usize {
         let p = self.pool.lock().unwrap();
         p.workers.iter().filter(|w| w.online).count()
+    }
+
+    /// 调整某台 worker 的并发槽。只发通知，本地立刻生效；worker 收到后改自己的上限。
+    pub fn set_slots(&self, id: usize, slots: u32) {
+        let slots = slots.clamp(1, 16);
+        let mut p = self.pool.lock().unwrap();
+        p.next_seq += 1;
+        let seq = p.next_seq;
+        if let Some(w) = p.workers.iter_mut().find(|w| w.id == id) {
+            w.slots = slots;
+            write_msg(&w.out, &Msg::Slots { seq, slots });
+        }
+    }
+
+    /// 停用 / 启用一台 worker。停用只是不再派活，连接保持——
+    /// 直接踢掉的话它会 1 秒后重连上来，等于没停。
+    pub fn set_paused(&self, id: usize, paused: bool) {
+        let mut p = self.pool.lock().unwrap();
+        if let Some(w) = p.workers.iter_mut().find(|w| w.id == id) {
+            w.paused = paused;
+        }
     }
 
     /// worker 恢复后清掉它的拒绝记录（路径挂载修好了能再次接单）。
@@ -616,6 +682,7 @@ fn view_of(w: &Worker) -> WorkerView {
         chunk: w.chunk.clone(),
         frame: w.frame,
         mem_mb: w.mem_mb,
+        paused: w.paused,
     }
 }
 
@@ -700,6 +767,8 @@ fn serve_as_worker(stream: TcpStream, slots: u32) -> std::io::Result<()> {
 
     let installs = houdini::detect_installs();
     let vers: Vec<String> = installs.iter().map(|i| i.version.clone()).collect();
+    // 主控可以随时调槽数，所以不能是函数参数那种一次性的值
+    let slots = Arc::new(AtomicU32::new(slots.max(1)));
 
     write_msg(
         &out_tx,
@@ -707,7 +776,7 @@ fn serve_as_worker(stream: TcpStream, slots: u32) -> std::io::Result<()> {
             seq: 0,
             ver: PROTO,
             host: host_of_me(),
-            slots: slots.max(1),
+            slots: slots.load(Ordering::SeqCst),
             houdini: vers,
         },
     );
@@ -747,7 +816,7 @@ fn serve_as_worker(stream: TcpStream, slots: u32) -> std::io::Result<()> {
             &Msg::Claim {
                 seq: 0,
                 busy: b,
-                free: slots.saturating_sub(b),
+                free: slots.load(Ordering::SeqCst).saturating_sub(b),
             },
         );
     }
@@ -822,17 +891,20 @@ fn serve_as_worker(stream: TcpStream, slots: u32) -> std::io::Result<()> {
                 let cancel = cancel_flag.clone();
                 let cur = current.clone();
                 let busy2 = busy.clone();
+                let slots2 = slots.clone();
                 let hython = inst.hython.clone();
                 thread::spawn(move || {
-                    let kind = exec_chunk(&hython, &hip_path, &node, &frames, &job, &chunk, &out, &cancel);
+                    let r = exec_chunk(&hython, &hip_path, &node, &frames, &job, &chunk, &out, &cancel);
                     write_msg(
                         &out,
                         &Msg::Result {
                             job: job.clone(),
                             chunk: chunk.clone(),
-                            kind: kind.0,
-                            detail: kind.1,
-                            code: kind.2,
+                            kind: r.kind,
+                            detail: r.detail,
+                            code: r.code,
+                            boot_ms: r.boot_ms,
+                            frame_ms: r.frame_ms,
                         },
                     );
                     // 清掉当前块，让心跳不再报它
@@ -842,7 +914,17 @@ fn serve_as_worker(stream: TcpStream, slots: u32) -> std::io::Result<()> {
                         c.1.clear();
                     }
                     drop(c);
-                    busy2.fetch_sub(1, Ordering::SeqCst);
+                    let b = busy2.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+                    // 主动报到：主控靠这一句立刻知道「我又空出来了」，
+                    // 不用等下一次心跳（5 秒）才发现
+                    write_msg(
+                        &out,
+                        &Msg::Claim {
+                            seq: 0,
+                            busy: b,
+                            free: slots2.load(Ordering::SeqCst).saturating_sub(b),
+                        },
+                    );
                 });
             }
             Msg::Cancel { job, chunk } => {
@@ -850,6 +932,19 @@ fn serve_as_worker(stream: TcpStream, slots: u32) -> std::io::Result<()> {
                 if cur.0 == job && cur.1 == chunk {
                     cancel_flag.store(true, Ordering::SeqCst);
                 }
+            }
+            Msg::Slots { slots: n, .. } => {
+                slots.store(n.clamp(1, 16), Ordering::SeqCst);
+                wlog(&format!("[HRQ worker] 并发槽调整为 {n}"));
+                let b = busy.load(Ordering::SeqCst);
+                write_msg(
+                    &out_tx,
+                    &Msg::Claim {
+                        seq: 0,
+                        busy: b,
+                        free: slots.load(Ordering::SeqCst).saturating_sub(b),
+                    },
+                );
             }
             _ => {}
         }
@@ -905,6 +1000,32 @@ fn same_minor(a: &str, b: &str) -> bool {
     ka == kb && ka.len() >= 2
 }
 
+/// 一块的执行结果 + 实测耗时（主控拿它算分片大小）。
+struct ChunkOut {
+    kind: String,
+    detail: String,
+    code: i32,
+    /// 起进程 → `##READY`。这一段是纯开销，跟帧数无关
+    boot_ms: u64,
+    /// 该块平均单帧耗时
+    frame_ms: u64,
+}
+
+impl ChunkOut {
+    fn end(kind: &str, detail: &str, code: i32) -> ChunkOut {
+        ChunkOut {
+            kind: kind.into(),
+            detail: detail.into(),
+            code,
+            boot_ms: 0,
+            frame_ms: 0,
+        }
+    }
+    fn fail(detail: impl Into<String>) -> ChunkOut {
+        ChunkOut::end("fail", &detail.into(), 3)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exec_chunk(
     hython: &std::path::Path,
@@ -915,10 +1036,10 @@ fn exec_chunk(
     chunk: &str,
     out: &Sender<String>,
     cancel: &Arc<AtomicBool>,
-) -> (String, String, i32) {
+) -> ChunkOut {
     let script = pyproc::script_path("render.py");
     if !script.exists() {
-        return ("fail".into(), format!("找不到 render.py: {}", script.display()), 3);
+        return ChunkOut::fail(format!("找不到 render.py: {}", script.display()));
     }
 
     // 块文件放**本机**临时目录，文件名带块标识：同一台机器上跑同一 job 的两个块不能撞名
@@ -931,9 +1052,10 @@ fn exec_chunk(
 
     let json = serde_json::json!({ "frames": frames });
     if let Err(e) = std::fs::write(&plan, json.to_string()) {
-        return ("fail".into(), format!("写帧计划失败: {e}"), 3);
+        return ChunkOut::fail(format!("写帧计划失败: {e}"));
     }
 
+    let started = Instant::now();
     let mut cmd = pyproc::hidden(hython);
     cmd.arg(&script)
         .arg(hip)
@@ -951,11 +1073,10 @@ fn exec_chunk(
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_file(&plan);
-            return (
-                "fail".into(),
-                format!("启动 hython 失败: {e}（{}）", hython.display()),
-                3,
-            );
+            return ChunkOut::fail(format!(
+                "启动 hython 失败: {e}（{}）",
+                hython.display()
+            ));
         }
     };
 
@@ -977,9 +1098,11 @@ fn exec_chunk(
         });
     }
 
-    let start = Instant::now();
     let mut ready = false;
-    let mut result: Option<(String, String, i32)> = None;
+    let mut ready_at: Option<Instant> = None;
+    let mut done_frames = 0u32;
+    let mut last_done: Option<Instant> = None;
+    let mut result: Option<ChunkOut> = None;
     let mut cancel_at: Option<Instant> = None;
     let mut killed = false;
 
@@ -1006,10 +1129,17 @@ fn exec_chunk(
                     None => (rest, ""),
                 };
                 match tag {
-                    "READY" => ready = true,
-                    "PREFLIGHT" => result = Some(("preflight".into(), arg.into(), 2)),
-                    "FAIL" => result = Some(("fail".into(), arg.into(), 3)),
-                    "CANCELED" => result = Some(("canceled".into(), String::new(), 4)),
+                    "READY" => {
+                        ready = true;
+                        ready_at.get_or_insert_with(Instant::now);
+                    }
+                    "DONE" => {
+                        done_frames += 1;
+                        last_done = Some(Instant::now());
+                    }
+                    "PREFLIGHT" => result = Some(ChunkOut::end("preflight", arg, 2)),
+                    "FAIL" => result = Some(ChunkOut::end("fail", arg, 3)),
+                    "CANCELED" => result = Some(ChunkOut::end("canceled", "", 4)),
                     _ => {}
                 }
             } else {
@@ -1021,16 +1151,16 @@ fn exec_chunk(
             Ok(Some(st)) => {
                 if result.is_none() {
                     result = Some(if st.success() {
-                        ("ok".into(), String::new(), 0)
+                        ChunkOut::end("ok", "", 0)
                     } else {
-                        ("fail".into(), format!("hython 退出码 {:?}", st.code()), 3)
+                        ChunkOut::fail(format!("hython 退出码 {:?}", st.code()))
                     });
                 }
                 true
             }
             Ok(None) => false,
             Err(e) => {
-                result = Some(("fail".into(), format!("等待进程失败: {e}"), 3));
+                result = Some(ChunkOut::fail(format!("等待进程失败: {e}")));
                 let _ = child.kill();
                 true
             }
@@ -1047,15 +1177,13 @@ fn exec_chunk(
             if t.elapsed() > Duration::from_secs(20) && !killed {
                 let _ = child.kill();
                 killed = true;
-                result = Some(("canceled".into(), String::new(), 4));
+                result = Some(ChunkOut::end("canceled", "", 4));
             }
         }
-        if !ready && result.is_none() && start.elapsed() > Duration::from_secs(300) {
+        if !ready && result.is_none() && started.elapsed() > Duration::from_secs(300) {
             let _ = child.kill();
-            result = Some((
-                "fail".into(),
-                "启动超时 5 分钟（许可证被占用，或工程过大）".into(),
-                3,
+            result = Some(ChunkOut::fail(
+                "启动超时 5 分钟（许可证被占用，或工程过大）",
             ));
         }
 
@@ -1064,7 +1192,16 @@ fn exec_chunk(
 
     let _ = std::fs::remove_file(&plan);
     let _ = std::fs::remove_file(&cancel_file);
-    result.unwrap_or_else(|| ("fail".into(), "未知结束状态".into(), 3))
+    let mut r = result.unwrap_or_else(|| ChunkOut::fail("未知结束状态"));
+    if let Some(t) = ready_at {
+        r.boot_ms = (t - started).as_millis() as u64;
+        if let Some(last) = last_done {
+            if done_frames > 0 {
+                r.frame_ms = ((last - t).as_millis() as u64 / done_frames as u64).max(1);
+            }
+        }
+    }
+    r
 }
 
 fn safe_name(s: &str) -> String {
@@ -1169,5 +1306,74 @@ mod tests {
     fn chunk_key_distinct() {
         assert_ne!(chunk_key("j", "1-2"), chunk_key("j", "3-4"));
         assert_eq!(chunk_key("j", "1-2"), "j#1-2");
+    }
+
+    /// 假 worker：报完 Hello 就一直挂着读，不回应 assign。
+    fn fake_worker(port: u16, slots: u32) {
+        thread::spawn(move || {
+            let Ok(s) = TcpStream::connect(("127.0.0.1", port)) else {
+                return;
+            };
+            let mut w = s.try_clone().unwrap();
+            let hello = Msg::Hello {
+                seq: 0,
+                ver: PROTO,
+                host: "TEST-WS".into(),
+                slots,
+                houdini: vec!["21.0.596".into()],
+            };
+            let _ = writeln!(w, "{}", hello.to_line());
+            let _ = w.flush();
+            // 挂着直到连接断掉：连接一断主控会把这台标成离线，测的就不是停用了
+            for _l in BufReader::new(s).lines().map_while(Result::ok) {}
+        });
+    }
+
+    /// 停用与「失败换机」都需要真实连接才能验，这里用一台假 worker 走完整握手。
+    #[test]
+    fn paused_and_excluded_workers_get_no_work() {
+        let port = 17891;
+        let Ok((hub, rx)) = Hub::start(port) else {
+            eprintln!("端口 {port} 被占用，跳过");
+            return;
+        };
+        fake_worker(port, 2);
+
+        let mut id = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(HubEvent::Online(v)) = rx.recv_timeout(Duration::from_millis(200)) {
+                id = v.id;
+                break;
+            }
+        }
+        assert!(id > 0, "假 worker 没接上");
+
+        let req = |chunk: &str| AssignReq {
+            job: "j".into(),
+            chunk: chunk.into(),
+            hip: "h.hip".into(),
+            node: "/out/render".into(),
+            houdini: String::new(),
+            output: "/o.$F.exr".into(),
+            frames: vec![1],
+            exclude: Vec::new(),
+        };
+
+        assert!(hub.dispatch(&req("1-1")).is_some(), "空闲时应该能派");
+        assert_eq!(hub.idle_slots(), 1);
+
+        // 失败换机：把这块从这台机器上排除
+        let mut r2 = req("2-2");
+        r2.exclude = vec![id];
+        assert!(hub.dispatch(&r2).is_none(), "exclude 应该跳过这台");
+
+        // 停用：连接保持，但不派新活（直接踢掉的话它 1 秒后会重连回来）
+        hub.set_paused(id, true);
+        assert_eq!(hub.idle_slots(), 0, "停用的机器不该算进空闲槽");
+        assert!(hub.dispatch(&req("3-3")).is_none(), "停用后不该再接活");
+
+        hub.set_paused(id, false);
+        assert!(hub.dispatch(&req("4-4")).is_some(), "启用后应该恢复接活");
     }
 }

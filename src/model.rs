@@ -210,6 +210,12 @@ pub struct JobSpec {
     pub output: String,
     /// 本任务要跑的帧集合：连续区间与不连续帧都行（1052,1055,1065-1070）
     pub frames: FrameSet,
+    /// 顺序执行：整包交给一台机器，绝不切片。
+    ///
+    /// 输出路径带 `$F` 只说明「每帧写不同文件」，不代表「帧与帧无关」。
+    /// 解算类节点（SOP solver / 依赖上一帧的 cache）分片后结果会错，而且错得
+    /// 很隐蔽——程序判断不出来，只能由人勾。默认关（允许分片）。
+    pub sequential: bool,
 }
 
 impl JobSpec {
@@ -237,6 +243,11 @@ pub struct JobView {
     pub frames: String,
     pub tone: i32,
     pub message: String,
+    /// 正在/曾经跑这个任务的机器（"本机"、worker 主机名，逗号分隔）。
+    /// 只有在有人接手后才有值，排队中是空串。
+    pub host: String,
+    /// 顺序执行标记（界面上是「顺序 / 并行」切换）
+    pub sequential: bool,
 }
 
 // ───────────────────────── 事件 ─────────────────────────

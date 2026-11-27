@@ -61,7 +61,9 @@ impl Db {
                 attempts   INTEGER NOT NULL,
                 -- 帧集合的规范写法（1052,1055-1056,1065-1070）；老库补列后为空串，
                 -- 读的时候为空就退回 fstart..fend 当连续区间
-                frames     TEXT NOT NULL DEFAULT ''
+                frames     TEXT NOT NULL DEFAULT '',
+                -- 顺序执行：1 = 不允许多机分片（跨帧依赖的解算序列）
+                sequential INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS frames (
                 job_id TEXT NOT NULL,
@@ -84,6 +86,12 @@ impl Db {
         if !self.has_column("jobs", "frames") {
             let _ = self.conn.execute_batch(
                 "ALTER TABLE jobs ADD COLUMN frames TEXT NOT NULL DEFAULT ''",
+            );
+        }
+        // 老库补列：jobs.sequential（顺序执行标记）
+        if !self.has_column("jobs", "sequential") {
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE jobs ADD COLUMN sequential INTEGER NOT NULL DEFAULT 0",
             );
         }
         Ok(())
@@ -189,11 +197,13 @@ impl Db {
     pub fn save_job(&self, spec: &JobSpec, ord: i64, status: JobStatus, attempts: u32) {
         let _ = self.conn.execute(
             "INSERT INTO jobs (id, ord, project_key, hip, hython, houdini, shot, node_path,
-                               node_type, category, output, fstart, fend, status, attempts, frames)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                               node_type, category, output, fstart, fend, status, attempts, frames,
+                               sequential)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
              ON CONFLICT(id) DO UPDATE SET
                 ord=excluded.ord, status=excluded.status, attempts=excluded.attempts,
-                fstart=excluded.fstart, fend=excluded.fend, frames=excluded.frames",
+                fstart=excluded.fstart, fend=excluded.fend, frames=excluded.frames,
+                sequential=excluded.sequential",
             params![
                 spec.id,
                 ord,
@@ -210,7 +220,8 @@ impl Db {
                 spec.frames.end(),
                 status.as_str(),
                 attempts,
-                spec.frames.label()
+                spec.frames.label(),
+                spec.sequential as i32
             ],
         );
     }
@@ -226,11 +237,13 @@ impl Db {
         for (spec, ord, status, attempts) in jobs {
             let _ = tx.execute(
                 "INSERT INTO jobs (id, ord, project_key, hip, hython, houdini, shot, node_path,
-                                   node_type, category, output, fstart, fend, status, attempts, frames)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                                   node_type, category, output, fstart, fend, status, attempts, frames,
+                                   sequential)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
                  ON CONFLICT(id) DO UPDATE SET
                     ord=excluded.ord, status=excluded.status, attempts=excluded.attempts,
-                    fstart=excluded.fstart, fend=excluded.fend, frames=excluded.frames",
+                    fstart=excluded.fstart, fend=excluded.fend, frames=excluded.frames,
+                    sequential=excluded.sequential",
                 params![
                     spec.id,
                     ord,
@@ -247,7 +260,8 @@ impl Db {
                     spec.frames.end(),
                     status.as_str(),
                     attempts,
-                    spec.frames.label()
+                    spec.frames.label(),
+                    spec.sequential as i32
                 ],
             );
         }
@@ -293,7 +307,7 @@ impl Db {
         let mut out = Vec::new();
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT id,project_key,hip,hython,houdini,shot,node_path,node_type,category,
-                    output,fstart,fend,status,attempts,frames
+                    output,fstart,fend,status,attempts,frames,sequential
              FROM jobs ORDER BY ord ASC",
         ) else {
             return out;
@@ -315,6 +329,7 @@ impl Db {
                 r.get::<_, String>(12)?,
                 r.get::<_, i64>(13)?,
                 r.get::<_, String>(14)?,
+                r.get::<_, i64>(15)?,
             ))
         }) {
             for row in rows.flatten() {
@@ -334,6 +349,7 @@ impl Db {
                     status,
                     attempts,
                     frames,
+                    sequential,
                 ) = row;
                 // frames 列是后加的：老库里是空串，退回 fstart..fend 当连续区间
                 let frames = FrameSet::parse(&frames).unwrap_or_else(|_| FrameSet::span(fstart, fend));
@@ -350,6 +366,7 @@ impl Db {
                         category: Category::parse(&category),
                         output,
                         frames,
+                        sequential: sequential != 0,
                     },
                     JobStatus::parse(&status),
                     attempts as u32,

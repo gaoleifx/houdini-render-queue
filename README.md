@@ -66,7 +66,9 @@ python tools/peek_icon.py dist/houdini-render-queue.exe check.png   # 校验 exe
 --font-panel             调试：直接打开字体面板
 --font-filter <词>       调试：预置字体搜索词
 --list-fonts             调试：打印枚举到的系统字体（含序号）后退出
---debug-invoke <回调名>  调试：直接触发一次按钮回调（clear-finished / restart-all），配合 --snapshot 做回归
+--debug-invoke <回调名>  调试：直接触发一次按钮回调（clear-finished / restart-all /
+                         worker-slots:<id>:<n> / worker-pause:<id>:<0|1>），配合 --snapshot 做回归
+--debug-invoke-delay <ms> 调试：推迟上面这条的触发时间（多机要等 worker 连上来）
 --listen [端口]          开启多机：本机当主控监听（默认 7878）
 --worker --connect <地址> 当执行端，连到主控干活（不显示界面）
 --slots <n>              worker 的并发槽位，默认 1
@@ -92,14 +94,19 @@ houdini-render-queue.exe --worker --connect 192.168.1.10:7878
 
 worker 会自己报本机的 Houdini 版本、连不上会自动重连，日志写在
 `%TEMP%\HoudiniRenderQueue\worker.log`。主控顶栏的「设备」按钮能看到谁接进来了、
-各自在跑哪一块。
+各自在跑哪一块，也能直接调每台的并发槽、或者临时停用一台（比如有人要拿它干别的）。
 
 几条行为约定：
 
 - **按帧块派发**：一个任务会被切成若干段（第一刀对半分，之后谁空闲谁拿），
   每段是一个 hython 进程；断点续渲照旧，帧记录在 master 的库里。
+- **块不会切得太碎**：主控记着每个任务实测的「加载耗时 / 单帧耗时」，
+  切出来的块至少够摊薄一次 hip 加载。实测数据存在库里，重启后仍然有效。
 - **输出路径不带帧变量（`$F`）的任务不会分片**，整包给一台机器——否则多台同时写一个文件必坏。
+- **解算类节点请手动切「顺序」**：队列卡片上有「并行 / 顺序」开关。跨帧依赖的节点
+  分片后结果会错，而且错得隐蔽，程序判断不出来。
 - **路径或版本不对会拒绝接单**，主控换一台机器派，不会渲到一半才失败。
+- **一块失败会换一台机器重试**；机器掉线时它手上的帧自动退回队列，任务不会卡在「执行中」。
 - 关掉主控 = 全部停止；worker 会跑完当前帧再退出，已完成的帧不丢。
 - 没有 `--listen` 时完全是单机模式，行为与以前一模一样。
 

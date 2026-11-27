@@ -5,10 +5,11 @@ export { Palette }
 
 export struct Shot { name: string, sub: string, meta: string, tone: int }
 export struct OutNode { checked: bool, path: string, ntype: string, category: string, output: string, range: string, status: string, tone: int }
-export struct QTask { nid: string, title: string, shot: string, category: string, range: string, status: string, progress: int, frames: string, tone: int }
+export struct QTask { nid: string, title: string, shot: string, category: string, range: string, status: string, progress: int, frames: string, tone: int, host: string, seq: bool }
 
-// 设备面板一行：一台参与渲染的机器（或本机自己的执行槽）
-export struct Device { host: string, state: string, slots: string, houdini: string, job: string, tone: int }
+// 设备面板一行：一台参与渲染的机器（或本机自己的执行槽）。
+// id = 0 是本机（不可调槽位、不可停用）；can-edit 控制按钮是否可点（离线机器不能调）。
+export struct Device { id: int, host: string, state: string, slots: string, n-slots: int, houdini: string, job: string, tone: int, paused: bool, can-edit: bool }
 
 // ─────────────────────────────────────────────────────────────
 // 主题 token：暗房仪器风。深石墨底 + 暖灰字 + 单一琥珀强调。
@@ -130,11 +131,14 @@ component Badge inherits Rectangle {
 component Chip inherits Rectangle {
     in property <string> label;
     in-out property <bool> active: false;
+    /// 置灰且不可点（到下限/上限时用）
+    in property <bool> disabled: false;
     in property <length> w: 46px;
     callback clicked();
     width: w;
     height: 20px;
     border-radius: 5px;
+    opacity: disabled ? 0.35 : 1;
     background: active ? Theme.accent-soft : (ta.has-hover ? Theme.hover : transparent);
     border-width: 1px;
     border-color: active ? Theme.accent-line : (ta.has-hover ? Theme.border-2 : Theme.border-2);
@@ -148,6 +152,7 @@ component Chip inherits Rectangle {
         vertical-alignment: center;
     }
     ta := TouchArea {
+        enabled: !root.disabled;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
@@ -582,6 +587,12 @@ export component AppWindow inherits Window {
     /// 面板底部那行提示（监听地址 / 未开启时的说明）
     in-out property <string> device-hint: "";
     callback toggle-devices();
+    /// 调某台 worker 的并发槽：参数是 (worker id, 目标槽数)
+    callback worker-slots(int, int);
+    /// 停用 / 启用某台 worker
+    callback worker-pause(int, bool);
+    /// 切换某个任务的「顺序执行」：整包派一台机器，不分片
+    callback task-sequential(string);
 
     // 日志跟随：有新日志时把日志视图贴到最底部（超出范围由 Flickable 自行夹紧）
     changed log-text => {
@@ -1143,6 +1154,8 @@ export component AppWindow inherits Window {
                                         }
                                         HorizontalLayout {
                                             spacing: 6px;
+                                            // 执行机器：本机 / 单台机器名 / 「多机 N」
+                                            if t.host != "" : Tag { text: t.host; tint: Theme.teal; }
                                             Text {
                                                 text: t.shot + " · " + t.category + " · " + t.range;
                                                 font-family: Fonts.mono;
@@ -1150,6 +1163,14 @@ export component AppWindow inherits Window {
                                                 color: Theme.text-3;
                                                 horizontal-stretch: 1;
                                                 overflow: elide;
+                                            }
+                                            // 顺序执行开关：整包派一台，不切帧块。
+                                            // 解算类节点（依赖上一帧）必须开，否则分片后结果会错
+                                            Chip {
+                                                label: t.seq ? "顺序" : "并行";
+                                                w: 36px;
+                                                active: t.seq;
+                                                clicked => { root.task-sequential(t.nid); }
                                             }
                                             Text {
                                                 text: t.frames;
@@ -1317,8 +1338,9 @@ export component AppWindow inherits Window {
                                 font-weight: 600;
                                 color: Theme.text;
                                 vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
                             }
-                            Rectangle { horizontal-stretch: 1; }
                             Tag { text: dev.slots; }
                             Tag { text: dev.state; tint: Tone.fg(dev.tone); }
                         }
@@ -1334,6 +1356,30 @@ export component AppWindow inherits Window {
                             color: Theme.text-2;
                             overflow: elide;
                             visible: dev.job != "";
+                        }
+                        // 操作行：槽位增减 + 停用。本机那行不显示（本机槽位在顶栏调）
+                        if dev.can-edit : HorizontalLayout {
+                            spacing: 4px;
+                            Chip {
+                                label: "−";
+                                w: 24px;
+                                // 下限 1：多开 hython 很容易把机器压进 swap，总吞吐反而掉
+                                disabled: dev.n-slots <= 1;
+                                clicked => { root.worker-slots(dev.id, dev.n-slots - 1); }
+                            }
+                            Chip {
+                                label: "+";
+                                w: 24px;
+                                disabled: dev.n-slots >= 16;
+                                clicked => { root.worker-slots(dev.id, dev.n-slots + 1); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Chip {
+                                label: dev.paused ? "启用" : "停用";
+                                w: 46px;
+                                active: dev.paused;
+                                clicked => { root.worker-pause(dev.id, !dev.paused); }
+                            }
                         }
                     }
 

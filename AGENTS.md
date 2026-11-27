@@ -133,7 +133,18 @@ worker（同一 exe --worker --connect host:port）→ 主动拨号，收活、�
   `free_frames()` = 全集 − 三者。
 - **`paced` 标记**：任务第一次分片时「对半分」，之后谁拿都是整包剩余。不加这个标记，
   本地会 100→50→25→13→6 一路对半切，每段都重开一次 hython，加载开销把并行收益吃光。
-- **`is_splittable`**：只看输出路径是否含 `$F`/`${F`。写单文件（mov、单个 usd）的任务必须整包派一台。
+- **`is_splittable`**：输出路径要含 `$F`/`${F`，且不能勾「顺序执行」。写单文件（mov、单个 usd）
+  的任务必须整包派一台；解算类节点（依赖上一帧）靠人工勾顺序执行——程序判断不出来。
+- **分片下限来自实测**：`Perf { boot_ms, frame_ms }` 按任务记在 meta 的 `perf` 键里，
+  `min_frames()` = 1.5×加载/单帧。切出来的块如果小到「算 3 帧、加载 60 秒」，多机反而更慢。
+  没测到过时退回经验值 8 帧。
+- **失败要换机**：`Rt.avoid` 记下失败的 worker id，`AssignReq.exclude` 让 `dispatch` 跳过它。
+  否则同一块会被派回同一台，一路重试一路失败，attempts 白白烧完。
+- **掉线要退回**：Hub 给每台 worker 记 `inflight: Vec<(job, chunk)>`，连接断或心跳超时时把这份
+  放进 `HubEvent::Offline.running`；引擎把对应帧退回 `free_frames()` 并把任务放回排队。
+  不做这件事，机器一断网那些帧既不完成也不重派，任务永远停在「执行中」。
+- **忙数由主控记账**：`dispatch` +1、`Result`/`Reject` −1，**不采信** worker 心跳/claim 里的数字。
+  采信的话，过期的 claim 会把刚派出去的槽报成空闲，往 1 槽机器上压第二块。
 - **没挂 Hub 时整条多机路径不执行**，单机行为与旧版完全一致（改动时守住这条）。
 
 worker 侧两个坑：
@@ -239,6 +250,9 @@ cargo build --release    # 产物 target/release/houdini-render-queue.exe
 --probe-window                                     打印根元素 layout-info（窗口拖不动时先看 min 是否等于 max）
 --list-fonts                                       打印枚举到的系统字体（带序号）后退出
 --debug-invoke clear-finished|restart-all          直接触发回调，做回归
+--debug-invoke worker-slots:<id>:<n>               调某台 worker 的槽位（同设备面板 +/-）
+--debug-invoke worker-pause:<id>:<0|1>             停用/启用某台 worker
+--debug-invoke-delay <ms>                          推迟上面这条的触发时间（多机要等 worker 连上）
 --listen [端口]                                    开多机监听（默认 7878），不起就不走多机路径
 --worker --connect <host:port> [--slots n]         当执行端（不初始化界面/数据库）
 --devices-open                                     启动即展开设备面板，配合 --snapshot 回归

@@ -388,7 +388,8 @@ fn short_job(id: &str) -> String {
         .to_string()
 }
 
-fn qtask_of(v: &JobView) -> QTask {    QTask {
+fn qtask_of(v: &JobView) -> QTask {
+    QTask {
         nid: v.id.clone().into(),
         title: v.title.clone().into(),
         shot: v.shot.clone().into(),
@@ -398,6 +399,8 @@ fn qtask_of(v: &JobView) -> QTask {    QTask {
         progress: v.progress,
         frames: v.frames.clone().into(),
         tone: v.tone,
+        host: v.host.clone().into(),
+        seq: v.sequential,
     }
 }
 
@@ -473,6 +476,13 @@ fn make_spec(app: &App, pi: usize, ni: usize) -> Option<JobSpec> {
         .get(&id)
         .cloned()
         .unwrap_or_else(|| default_range(p, n));
+    // 顺序执行标记跟着任务走：取消勾选再加回来、甚至重启程序，都还记着
+    let sequential = app
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .map(|j| j.sequential)
+        .unwrap_or(false);
     Some(JobSpec {
         id,
         project_key: p.key.clone(),
@@ -485,6 +495,7 @@ fn make_spec(app: &App, pi: usize, ni: usize) -> Option<JobSpec> {
         category: n.cat(),
         output: n.output.clone().unwrap_or_default(),
         frames: fr,
+        sequential,
     })
 }
 
@@ -1904,6 +1915,38 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let app = app.clone();
+        ui.on_worker_slots(move |id, n| {
+            // 界面只报「按了 + 或 -」后的目标值，状态全在引擎侧，面板靠快照刷新
+            app.borrow()
+                .engine
+                .send(Cmd::WorkerSlots(id.max(0) as usize, n.clamp(1, 16) as u32));
+        });
+    }
+
+    {
+        let app = app.clone();
+        ui.on_worker_pause(move |id, paused| {
+            app.borrow()
+                .engine
+                .send(Cmd::WorkerPause(id.max(0) as usize, paused));
+        });
+    }
+
+    {
+        let app = app.clone();
+        ui.on_task_sequential(move |id| {
+            let mut a = app.borrow_mut();
+            let Some(j) = a.jobs.iter_mut().find(|j| j.id == id.as_str()) else {
+                return;
+            };
+            j.sequential = !j.sequential;
+            let seq = j.sequential;
+            a.engine.send(Cmd::SetJobSequential(id.to_string(), seq));
+        });
+    }
+
+    {
+        let app = app.clone();
         let ui_weak = ui.as_weak();
         let picker = picker.clone();
         ui.on_font_changed(move || {
@@ -2043,31 +2086,49 @@ fn main() -> Result<(), slint::PlatformError> {
                                 .unwrap_or_default();
                             let mut list: Vec<Device> = Vec::with_capacity(views.len() + 1);
                             list.push(Device {
+                                id: 0,
                                 host: format!("{me}（本机）").into(),
                                 state: "本地".into(),
                                 slots: format!("{} 槽", a.concurrency).into(),
+                                n_slots: a.concurrency as i32,
                                 houdini: local_ver.into(),
                                 job: "".into(),
                                 tone: 5,
+                                paused: false,
+                                can_edit: false,
                             });
                             for v in views.iter() {
                                 list.push(Device {
+                                    id: v.id as i32,
                                     host: v.host.clone().into(),
-                                    state: if v.online {
-                                        format!("{}/{}", v.busy, v.slots).into()
-                                    } else {
+                                    state: if !v.online {
                                         "离线".into()
+                                    } else if v.paused {
+                                        "停用".into()
+                                    } else {
+                                        format!("{}/{}", v.busy, v.slots).into()
                                     },
                                     slots: format!("{} 槽", v.slots).into(),
+                                    n_slots: v.slots as i32,
                                     houdini: v.houdini.clone().into(),
                                     job: if v.online && !v.chunk.is_empty() {
                                         format!("{}  [{}]", short_job(&v.job), v.chunk).into()
+                                    } else if v.online && v.paused {
+                                        "不接新活".into()
                                     } else if v.online {
                                         "空闲".into()
                                     } else {
                                         "".into()
                                     },
-                                    tone: if v.online { 2 } else { 0 },
+                                    tone: if !v.online {
+                                        0
+                                    } else if v.paused {
+                                        4
+                                    } else {
+                                        2
+                                    },
+                                    paused: v.paused,
+                                    can_edit: v.online,
                                 });
                             }
                             ui.set_devices(ModelRc::new(VecModel::from(list)));
@@ -2183,15 +2244,33 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     // 调试用：--debug-invoke clear-finished|restart-all 直接触发一次按钮回调，
-    // 绕开鼠标命中测试，方便用快照做回归
+    // 绕开鼠标命中测试，方便用快照做回归。
+    // 多机那几个按钮还要带参数，写成 `worker-slots:<id>:<n>` / `worker-pause:<id>:<0|1>`
     if let Some(pos) = std::env::args().position(|a| a == "--debug-invoke") {
         if let Some(name) = std::env::args().nth(pos + 1) {
+            // 默认 1.5 秒后触发；多机相关的要等 worker 连上来，用 --debug-invoke-delay 推后
+            let delay = std::env::args()
+                .position(|a| a == "--debug-invoke-delay")
+                .and_then(|i| std::env::args().nth(i + 1))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1500);
             let ui_weak = ui.as_weak();
-            slint::Timer::single_shot(Duration::from_millis(1500), move || {
+            slint::Timer::single_shot(Duration::from_millis(delay), move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    match name.as_str() {
+                    let mut parts = name.split(':');
+                    match parts.next().unwrap_or("") {
                         "clear-finished" => ui.invoke_clear_finished(),
                         "restart-all" => ui.invoke_restart_all(),
+                        "worker-slots" => {
+                            let id = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                            let n = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                            ui.invoke_worker_slots(id, n);
+                        }
+                        "worker-pause" => {
+                            let id = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                            let p = parts.next().map(|s| s == "1").unwrap_or(true);
+                            ui.invoke_worker_pause(id, p);
+                        }
                         other => eprintln!("未知的调试回调: {other}"),
                     }
                 }

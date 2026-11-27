@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,12 @@ pub enum Cmd {
     AttachHub(Arc<Hub>, Receiver<HubEvent>),
     /// 设备面板打开时主动要一份快照
     RefreshWorkers,
+    /// 单台 worker 调并发槽
+    WorkerSlots(usize, u32),
+    /// 单台 worker 停用 / 启用（停用后不派新活，连接保持）
+    WorkerPause(usize, bool),
+    /// 切某个任务的分片策略：true = 顺序执行（整包派一台）
+    SetJobSequential(String, bool),
     Shutdown,
 }
 
@@ -43,9 +49,33 @@ enum WResult {
     Canceled,
 }
 
+/// 一块的实测耗时：加载（起进程 → READY）与平均单帧。
+///
+/// 分片不是为了「分得越细越快」——每片都要重开一次 hython、重读一遍 hip。
+/// 只有 `帧数 × 单帧耗时` 明显大于加载耗时时，切开才是赚的。这两个数就是判据。
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Perf {
+    #[serde(default)]
+    boot_ms: u64,
+    #[serde(default)]
+    frame_ms: u64,
+}
+
+impl Perf {
+    /// 值得单独起一个进程的最小帧数。加载开销要能被这块的计算量盖过去
+    /// （按「加载 ≤ 计算量的 2/3」算，即 1.5 倍）。
+    fn min_frames(&self) -> usize {
+        if self.boot_ms == 0 || self.frame_ms == 0 {
+            return 8; // 没测到过：退回经验值
+        }
+        let need = (self.boot_ms as f64 * 1.5 / self.frame_ms as f64).ceil() as usize;
+        need.clamp(2, 240)
+    }
+}
+
 enum WMsg {
     Frame(String, i32),
-    Done(String, WResult),
+    Done(String, WResult, Perf),
 }
 
 struct Rt {
@@ -68,6 +98,11 @@ struct Rt {
     /// 已经为这个任务做过一次「对半分」。只在第一次生效：否则本地会
     /// 100→50→25→13→6 一路对半切下去，每段都要重开一次 hython，加载开销爆炸。
     paced: bool,
+    /// 刚在这个任务上失败的 worker。重试时避开它们——不然同一块会被派回同一台，
+    /// 一路重试一路失败，直到 attempts 用完
+    avoid: HashSet<usize>,
+    /// 跑过这个任务的机器名（本机也记）。纯展示用，卡片上那枚标签
+    hosts: BTreeSet<String>,
 }
 
 impl Rt {
@@ -85,6 +120,8 @@ impl Rt {
             local: BTreeSet::new(),
             blocks: HashMap::new(),
             paced: false,
+            avoid: HashSet::new(),
+            hosts: BTreeSet::new(),
         }
     }
 
@@ -151,6 +188,11 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
     // 没挂 Hub 时整条多机路径不执行，单机行为与以前完全一致
     let mut hub: Option<Arc<Hub>> = None;
     let mut hub_rx: Option<Receiver<HubEvent>> = None;
+    // 每个任务的实测加载/单帧耗时（上次跑出来的），决定这次切多大的块
+    let mut perf: HashMap<String, Perf> = db
+        .get_meta("perf")
+        .and_then(|s| serde_json::from_str::<HashMap<String, Perf>>(&s).ok())
+        .unwrap_or_default();
 
     let _ = evt.send(Event::Queue(snapshot(&rt)));
 
@@ -218,6 +260,9 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                             r.status = JobStatus::Queued;
                             r.attempts = 0;
                             r.message.clear();
+                            // 上一轮拉黑的机器不作数了，新一轮重新给每台机会
+                            r.avoid.clear();
+                            r.hosts.clear();
                         }
                     }
                     state = RunState::Running;
@@ -281,6 +326,8 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                             r.message.clear();
                             r.done.clear();
                             r.paced = false;
+                            r.avoid.clear();
+                            r.hosts.clear();
                             db.clear_frames(&r.spec.id);
                             reset += 1;
                         }
@@ -321,6 +368,52 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         let _ = evt.send(Event::Workers(h.views()));
                     }
                 }
+                Cmd::WorkerSlots(id, n) => {
+                    if let Some(h) = &hub {
+                        h.set_slots(id, n);
+                        let _ = evt.send(Event::Workers(h.views()));
+                    }
+                }
+                Cmd::WorkerPause(id, paused) => {
+                    if let Some(h) = &hub {
+                        h.set_paused(id, paused);
+                        let _ = evt.send(Event::Workers(h.views()));
+                        let host = h
+                            .views()
+                            .iter()
+                            .find(|v| v.id == id)
+                            .map(|v| v.host.clone())
+                            .unwrap_or_default();
+                        log(
+                            &evt,
+                            format!(
+                                "{host} 已{}",
+                                if paused { "停用（不再派新活）" } else { "启用" }
+                            ),
+                        );
+                    }
+                }
+                Cmd::SetJobSequential(id, seq) => {
+                    let ord = rt.iter().position(|x| x.spec.id == id).unwrap_or(0) as i64;
+                    if let Some(r) = rt.iter_mut().find(|r| r.spec.id == id) {
+                        r.spec.sequential = seq;
+                        r.paced = false;
+                        db.save_job(&r.spec, ord, r.status, r.attempts);
+                        log(
+                            &evt,
+                            format!(
+                                "[{}] 改为{}",
+                                r.spec.title(),
+                                if seq {
+                                    "顺序执行（整包派一台机器，不分片）"
+                                } else {
+                                    "允许分片（多台机器各跑一段帧）"
+                                }
+                            ),
+                        );
+                    }
+                    let _ = evt.send(Event::Queue(snapshot(&rt)));
+                }
             }
         }
 
@@ -336,11 +429,16 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         }
                     }
                 }
-                Ok(WMsg::Done(id, res)) => {
+                Ok(WMsg::Done(id, res, p)) => {
                     if let Some(r) = rt.iter_mut().find(|r| r.spec.id == id) {
                         r.running = false;
                         // 本地线程退出：它认领过的帧全部释放（没跑完的回到可调度池）
                         r.local.clear();
+                        if p.frame_ms > 0 {
+                            // 本地跑的也是同一个 hip 同样的帧，实测数一样能用来算块大小
+                            perf.insert(id.clone(), p);
+                            save_perf(&db, &perf);
+                        }
                         if r.detached {
                             // 已从执行区移除，结果不再关心：不进重试、不留卡片
                             r.status = JobStatus::Canceled;
@@ -434,10 +532,12 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     HubEvent::Done {
                         job,
                         chunk,
+                        worker,
                         host,
                         kind,
                         detail,
-                        ..
+                        boot_ms,
+                        frame_ms,
                     } => {
                         if let Some(r) = rt.iter_mut().find(|r| r.spec.id == job) {
                             let frames = r.blocks.remove(&chunk).unwrap_or_default();
@@ -445,12 +545,19 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                                 r.remote.remove(f);
                             }
                             let title = r.spec.title();
+                            r.hosts.insert(host.clone());
+                            if boot_ms > 0 && frame_ms > 0 {
+                                perf.insert(job.clone(), Perf { boot_ms, frame_ms });
+                                save_perf(&db, &perf);
+                            }
                             if r.detached {
                                 r.status = JobStatus::Canceled;
                                 r.message.clear();
                             } else {
                                 match kind {
                                     DoneKind::Ok => {
+                                        // 这台上过了就没问题，之前拉黑的记录作废
+                                        r.avoid.remove(&worker);
                                         if r.all_done() {
                                             r.status = JobStatus::Success;
                                             r.message.clear();
@@ -474,6 +581,11 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                                     }
                                     DoneKind::Preflight | DoneKind::Fail => {
                                         r.attempts += 1;
+                                        // 下次重试别再派回这台：同一块在同一台反复失败
+                                        // 是 attempts 被白白烧完的最常见原因
+                                        if worker > 0 {
+                                            r.avoid.insert(worker);
+                                        }
                                         let what = if detail.is_empty() {
                                             "分片执行失败".to_string()
                                         } else {
@@ -501,7 +613,50 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         }
                         changed = true;
                     }
-                    HubEvent::Online(_) | HubEvent::Offline { .. } | HubEvent::Changed => {
+                    HubEvent::Offline {
+                        worker,
+                        host,
+                        running,
+                    } => {
+                        // 掉线的机器手上还有块：那些帧既不会完成也不会自己重派，
+                        // 必须在这里退回可调度池，否则任务永远停在「执行中」
+                        for (job, chunk) in running {
+                            let Some(r) = rt.iter_mut().find(|r| r.spec.id == job) else {
+                                continue;
+                            };
+                            let frames = r.blocks.remove(&chunk).unwrap_or_default();
+                            for f in &frames {
+                                r.remote.remove(f);
+                            }
+                            r.avoid.insert(worker);
+                            if frames.is_empty() {
+                                continue;
+                            }
+                            if !r.detached && matches!(r.status, JobStatus::Queued | JobStatus::Running) {
+                                // 别再切碎：接着按大块跑，少一次无谓的 hip 加载
+                                r.paced = true;
+                                r.status = if r.running || !r.blocks.is_empty() {
+                                    JobStatus::Running
+                                } else {
+                                    JobStatus::Queued
+                                };
+                                r.message = format!("{host} 掉线，{} 帧重新排队", frames.len());
+                                log(
+                                    &evt,
+                                    format!(
+                                        "[{}] {host} 掉线，{} 帧退回队列（这台机器本次不再派发）",
+                                        r.spec.title(),
+                                        frames.len()
+                                    ),
+                                );
+                            }
+                        }
+                        if let Some(h) = &hub {
+                            let _ = evt.send(Event::Workers(h.views()));
+                        }
+                        changed = true;
+                    }
+                    HubEvent::Online(_) | HubEvent::Changed => {
                         // 设备面板的数据走单独的快照，这里只驱动一次重排
                         if let Some(h) = &hub {
                             let _ = evt.send(Event::Workers(h.views()));
@@ -550,15 +705,19 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
 
                     let free = rt[idx].free_frames();
                     let remain = free.len();
-                    // 可分片的按份均摊；不可分片的（输出不带 $F）必须整包给一台。
-                    // 帧太少时也整包：一次 hip 加载几十秒，切两半纯亏（还是 8 帧起步）。
-                    // 只在任务第一次分片时切，之后谁拿都是整包剩余（见 `paced`）。
+                    // 可分片的按份均摊；不可分片的（输出不带 $F、或勾了顺序执行）
+                    // 必须整包给一台。
+                    //
+                    // 下限 `min_frames` 来自实测：一次 hip 加载可能要几十秒到几分钟，
+                    // 切出来的块如果小到「算 3 帧、加载 60 秒」，多机反而比单机慢。
+                    // 这个数一开始是经验值 8，跑过一次后就按真实耗时算了（见 Perf）。
+                    let min_chunk = perf.get(&rt[idx].spec.id).map(|p| p.min_frames()).unwrap_or(8);
                     let size = if is_splittable(&rt[idx].spec)
                         && !rt[idx].paced
-                        && remain >= 8
                         && shares > 1
+                        && remain >= min_chunk * 2
                     {
-                        remain.div_ceil(shares).max(2)
+                        remain.div_ceil(shares).max(min_chunk)
                     } else {
                         remain
                     };
@@ -572,6 +731,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         houdini: rt[idx].spec.houdini.clone(),
                         output: rt[idx].spec.output.clone(),
                         frames: take.clone(),
+                        exclude: rt[idx].avoid.iter().copied().collect(),
                     };
                     // dispatch 失败说明没有匹配的机器（版本不符 / 拒绝过），别死循环
                     let Some(t) = h.dispatch(&req) else { break };
@@ -588,6 +748,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     );
                     rt[idx].remote.extend(take.iter().copied());
                     rt[idx].blocks.insert(chunk, take);
+                    rt[idx].hosts.insert(t.host.clone());
                     rt[idx].paced = true;
                     if rt[idx].status == JobStatus::Queued {
                         rt[idx].status = JobStatus::Running;
@@ -628,10 +789,15 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
 
                 // 只要还有 worker 在线，本地最多先拿一半：worker 手上那点活很快结束，
                 // 把帧留在池子里它才能接上。没有 worker（纯单机）时仍然整包拿，
-                // 行为与旧版完全一致。
+                // 行为与旧版完全一致。切走的量同样不能低于「值得重开一次 hython」的门槛。
                 let mut frames = rt[idx].free_frames();
                 let remote_online = hub.as_ref().map(|h| h.online_count() > 0).unwrap_or(false);
-                if remote_online && !rt[idx].paced && frames.len() >= 8 {
+                let min_chunk = perf.get(&rt[idx].spec.id).map(|p| p.min_frames()).unwrap_or(8);
+                if remote_online
+                    && !rt[idx].paced
+                    && frames.len() >= min_chunk * 2
+                    && is_splittable(&rt[idx].spec)
+                {
                     frames.truncate(frames.len().div_ceil(2));
                     rt[idx].paced = true;
                 }
@@ -639,6 +805,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                 rt[idx].running = true;
                 rt[idx].status = JobStatus::Running;
                 rt[idx].cancel = Arc::new(AtomicBool::new(false));
+                rt[idx].hosts.insert("本机".into());
                 // 这些帧已交给本地线程：远端不能再派同一帧
                 rt[idx].local.extend(frames.iter().copied());
 
@@ -690,6 +857,23 @@ fn log(evt: &Sender<Event>, msg: String) {
     let _ = evt.send(Event::Log(format!("{}  {}", pyproc::now_hms(), msg)));
 }
 
+/// 队列卡片上那枚机器标签。卡片只有 260px 宽，多台时只报台数。
+fn host_label(hosts: &BTreeSet<String>) -> String {
+    match hosts.len() {
+        0 => String::new(),
+        1 => {
+            let h = hosts.iter().next().map(String::as_str).unwrap_or("");
+            if h.chars().count() > 10 {
+                let cut: String = h.chars().take(10).collect();
+                format!("{cut}…")
+            } else {
+                h.to_string()
+            }
+        }
+        n => format!("多机 {n}"),
+    }
+}
+
 /// 块名：`1052-1070`。只用于标识和日志，不参与去重（去重靠 `remote` 集合）。
 fn block_name(frames: &[i32]) -> String {
     match (frames.first(), frames.last()) {
@@ -703,13 +887,26 @@ fn block_name(frames: &[i32]) -> String {
 ///
 /// 只有输出路径里带帧变量（`$F` / `$F4` / `${F}`）时，不同帧才落到不同文件。
 /// 写单文件的任务（mov、单个 usd）一旦并行就是抢同一个文件，必须整包派一台。
+///
+/// 注意这只是**必要条件**：每帧写不同文件不代表帧与帧无关。解算类节点分片后
+/// 结果会错，程序判断不出来——所以还有 `sequential` 这个人工开关。
 fn is_splittable(spec: &JobSpec) -> bool {
+    if spec.sequential {
+        return false;
+    }
     let o = &spec.output;
     if o.is_empty() {
         return false;
     }
     let up = o.to_uppercase();
     up.contains("$F") || up.contains("${F")
+}
+
+/// 实测耗时落库（meta 里一行 JSON）。失败就失败，不影响调度。
+fn save_perf(db: &Db, perf: &HashMap<String, Perf>) {
+    if let Ok(s) = serde_json::to_string(perf) {
+        db.set_meta("perf", &s);
+    }
 }
 
 fn snapshot(rt: &[Rt]) -> Vec<JobView> {
@@ -744,6 +941,8 @@ fn snapshot(rt: &[Rt]) -> Vec<JobView> {
                 frames,
                 tone: r.status.tone(),
                 message: r.message.clone(),
+                host: host_label(&r.hosts),
+                sequential: r.spec.sequential,
             }
         })
         .collect()
@@ -778,7 +977,11 @@ fn run_worker(
 
     let plan_json = serde_json::json!({ "frames": frames });
     if let Err(e) = std::fs::write(&plan, plan_json.to_string()) {
-        let _ = tx.send(WMsg::Done(id, WResult::Fail(format!("写入帧计划失败: {e}"))));
+        let _ = tx.send(WMsg::Done(
+            id,
+            WResult::Fail(format!("写入帧计划失败: {e}")),
+            Perf::default(),
+        ));
         return;
     }
 
@@ -787,10 +990,12 @@ fn run_worker(
         let _ = tx.send(WMsg::Done(
             id,
             WResult::Fail(format!("找不到 render.py: {}", script.display())),
+            Perf::default(),
         ));
         return;
     }
 
+    let started = Instant::now();
     let mut cmd = pyproc::hidden(&spec.hython);
     cmd.arg(&script)
         .arg(&spec.hip)
@@ -810,6 +1015,7 @@ fn run_worker(
             let _ = tx.send(WMsg::Done(
                 id,
                 WResult::Fail(format!("启动 hython 失败: {e}（{}）", spec.hython.display())),
+                Perf::default(),
             ));
             return;
         }
@@ -833,8 +1039,10 @@ fn run_worker(
         });
     }
 
-    let start = Instant::now();
     let mut ready = false;
+    let mut ready_at: Option<Instant> = None;
+    let mut done_frames = 0u32;
+    let mut last_done: Option<Instant> = None;
     let mut result: Option<WResult> = None;
     let mut cancel_at: Option<Instant> = None;
     let mut killed = false;
@@ -854,6 +1062,7 @@ fn run_worker(
                     "BOOT" => {}
                     "READY" => {
                         ready = true;
+                        ready_at.get_or_insert_with(Instant::now);
                         let _ = evt.send(Event::Log(format!(
                             "{}  [{}] 工程加载完成",
                             pyproc::now_hms(),
@@ -862,6 +1071,8 @@ fn run_worker(
                     }
                     "FRAME" => {}
                     "DONE" => {
+                        done_frames += 1;
+                        last_done = Some(Instant::now());
                         if let Ok(f) = arg.parse::<i32>() {
                             let _ = tx.send(WMsg::Frame(id.clone(), f));
                             let _ = evt.send(Event::Log(format!(
@@ -947,7 +1158,7 @@ fn run_worker(
                 result = Some(WResult::Canceled);
             }
         }
-        if !ready && result.is_none() && start.elapsed() > Duration::from_secs(300) {
+        if !ready && result.is_none() && started.elapsed() > Duration::from_secs(300) {
             let _ = child.kill();
             result = Some(WResult::Fail(
                 "启动超时 5 分钟（可能是 Houdini 许可证被占用，或工程过大）".into(),
@@ -959,8 +1170,111 @@ fn run_worker(
 
     let _ = std::fs::remove_file(&plan);
     let _ = std::fs::remove_file(&cancel_file);
+
+    // 实测耗时：本地跑的也是同一个 hip、同样的帧，照样能用来算块大小
+    let mut p = Perf::default();
+    if let Some(t) = ready_at {
+        p.boot_ms = (t - started).as_millis() as u64;
+        if let Some(last) = last_done {
+            if done_frames > 0 {
+                p.frame_ms = ((last - t).as_millis() as u64 / done_frames as u64).max(1);
+            }
+        }
+    }
+
     let _ = tx.send(WMsg::Done(
         id,
         result.unwrap_or(WResult::Fail("未知结束状态".into())),
+        p,
     ));
+}
+
+// ───────────────────────── 单测 ─────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frames::FrameSet;
+
+    fn spec(output: &str, sequential: bool) -> JobSpec {
+        JobSpec {
+            id: "k::/out/render".into(),
+            project_key: "k".into(),
+            hip: "P://sh010.hip".into(),
+            hython: "hython.exe".into(),
+            houdini: "21.0.596".into(),
+            shot: "sh010".into(),
+            node_path: "/out/render".into(),
+            node_type: "karma".into(),
+            category: Category::Render,
+            output: output.into(),
+            frames: FrameSet::span(1, 100),
+            sequential,
+        }
+    }
+
+    #[test]
+    fn perf_min_frames_amortizes_boot() {
+        // 加载 60 秒、每帧 5 秒：一块至少要 18 帧，否则加载开销盖过计算
+        let p = Perf {
+            boot_ms: 60_000,
+            frame_ms: 5_000,
+        };
+        assert_eq!(p.min_frames(), 18);
+    }
+
+    #[test]
+    fn perf_min_frames_falls_back_without_data() {
+        assert_eq!(Perf::default().min_frames(), 8);
+        // 只测到一半的数据也不能用
+        let p = Perf {
+            boot_ms: 30_000,
+            frame_ms: 0,
+        };
+        assert_eq!(p.min_frames(), 8);
+    }
+
+    #[test]
+    fn perf_min_frames_clamped() {
+        // 加载极长 / 单帧极快：上限 240，不能把整包切到无限细
+        let p = Perf {
+            boot_ms: 600_000,
+            frame_ms: 1,
+        };
+        assert_eq!(p.min_frames(), 240);
+        // 加载比一帧还短：下限 2（1 帧的块没有意义）
+        let p = Perf {
+            boot_ms: 100,
+            frame_ms: 10_000,
+        };
+        assert_eq!(p.min_frames(), 2);
+    }
+
+    #[test]
+    fn splittable_needs_frame_var() {
+        assert!(is_splittable(&spec("/out/render.$F4.exr", false)));
+        assert!(is_splittable(&spec("/out/render.${F}.exr", false)));
+        // 写单文件：多台同时写必坏
+        assert!(!is_splittable(&spec("/out/preview.mov", false)));
+        assert!(!is_splittable(&spec("", false)));
+    }
+
+    #[test]
+    fn sequential_never_splits() {
+        // 输出带 $F 但勾了顺序执行：跨帧依赖的节点只能整包跑
+        assert!(!is_splittable(&spec("/out/render.$F4.exr", true)));
+    }
+
+    #[test]
+    fn host_label_shrinks() {
+        let mut s = BTreeSet::new();
+        assert_eq!(host_label(&s), "");
+        s.insert("WS-02".to_string());
+        assert_eq!(host_label(&s), "WS-02");
+        s.insert("WS-03".to_string());
+        assert_eq!(host_label(&s), "多机 2");
+        let mut one = BTreeSet::new();
+        one.insert("RENDER-FARM-NODE-007".to_string());
+        assert_eq!(host_label(&one), "RENDER-FAR…");
+    }
 }
