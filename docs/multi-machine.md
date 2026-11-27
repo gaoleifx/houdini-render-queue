@@ -506,7 +506,7 @@ APPDATA=<隔离目录> HRQ_HYTHON=<devtest\python 包装> houdini-render-queue.e
 
 ---
 
-## 13. P2 做了什么（2026.3.0）
+## 13. P2 做了什么（2026.2.1）
 
 P1 只是「能跑通」。P2 补的是真正上机之后一定会碰到的五件事。
 
