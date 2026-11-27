@@ -114,8 +114,9 @@ dist/            可分发产物（exe + python/），改完要手动同步
 设计文档在 `docs/multi-machine.md`，实现是 `src/remote.rs` + `queue.rs` 里几处钩子。
 
 ```
-主控（就是主界面）--listen 7878  →  起 Hub，TcpListener + 在线 worker 池
-worker（同一 exe --worker --connect host:port）→ 主动拨号，收活、起本机 hython 跑 render.py
+主控（就是主界面，设备面板「开启多机」/ --listen 7878）
+  → 起 Hub：TcpListener + 在线 worker 池 + UDP 7877 广播
+worker（同一 exe --worker [--connect host:port|auto]）→ 拨号（或听广播找主控），收活、跑 render.py
 ```
 
 要点：
@@ -131,20 +132,37 @@ worker（同一 exe --worker --connect host:port）→ 主动拨号，收活、�
   - `remote` 已派给远端、还没回报
   - `local` 已交给本地线程、还没完成
   `free_frames()` = 全集 − 三者。
-- **`paced` 标记**：任务第一次分片时「对半分」，之后谁拿都是整包剩余。不加这个标记，
-  本地会 100→50→25→13→6 一路对半切，每段都重开一次 hython，加载开销把并行收益吃光。
+- **分片是动态收敛的**，没有「只切一次」的标记了：条件是
+  `remain >= min_chunk × lanes × 2`，于是 100 帧自然走 50 → 25 → 25 收敛。
+  想加回 `paced` 式的硬开关之前先想清楚：那会让「第二台机器中途加入」拿不到活。
 - **`is_splittable`**：输出路径要含 `$F`/`${F`，且不能勾「顺序执行」。写单文件（mov、单个 usd）
   的任务必须整包派一台；解算类节点（依赖上一帧）靠人工勾顺序执行——程序判断不出来。
 - **分片下限来自实测**：`Perf { boot_ms, frame_ms }` 按任务记在 meta 的 `perf` 键里，
   `min_frames()` = 1.5×加载/单帧。切出来的块如果小到「算 3 帧、加载 60 秒」，多机反而更慢。
   没测到过时退回经验值 8 帧。
-- **失败要换机**：`Rt.avoid` 记下失败的 worker id，`AssignReq.exclude` 让 `dispatch` 跳过它。
-  否则同一块会被派回同一台，一路重试一路失败，attempts 白白烧完。
+- **失败要换机**：`Rt.avoid` 记下失败的**主机名**（不是连接 id——重连会换 id），
+  `AssignReq.exclude` 让 `dispatch` 跳过它。否则同一块会被派回同一台，一路重试一路失败，
+  attempts 白白烧完。worker 重连（`HubEvent::Online`）时清掉所有任务对它的 `avoid`：
+  挂载/许可证刚修好的机器不该永远接不到活。
 - **掉线要退回**：Hub 给每台 worker 记 `inflight: Vec<(job, chunk)>`，连接断或心跳超时时把这份
   放进 `HubEvent::Offline.running`；引擎把对应帧退回 `free_frames()` 并把任务放回排队。
   不做这件事，机器一断网那些帧既不完成也不重派，任务永远停在「执行中」。
 - **忙数由主控记账**：`dispatch` +1、`Result`/`Reject` −1，**不采信** worker 心跳/claim 里的数字。
   采信的话，过期的 claim 会把刚派出去的槽报成空闲，往 1 槽机器上压第二块。
+- **口令**：Hub 的 `token` 来自 `--token`，没有就用 `meta.multi_token`（首次自动生成后落库）。
+  **不能每次启动重新生成**——主控一重启，整批 worker 会被判「口令不对」退出。
+  口令错/协议版本不对时主控回 `Denied{why}` 并断开，worker 收到就 `exit(3)`，不无限重连。
+- **自动发现**：主控每 2 秒往 `255.255.255.255:7877` 和 `127.0.0.1:7877` 发
+  `Beacon{hrq:PROTO,port,master,need_token}`；**广播不带口令**（明文且谁都能收）。
+  worker `--connect auto` 时 bind `0.0.0.0:7877` 等广播；同机多开会 bind 失败，
+  此时必须手动 `--connect`（已在日志里明说）。
+- **主控重启不丢在跑的块**：worker 的 `Hello.resume` 带「本机在跑的块 + 帧列表」，
+  主控把接管来的块算进 `busy` 并回 `HubEvent::Resumed`，引擎写进 `blocks`/`remote`。
+  同时 worker 的 `Link` 有 600 行断线缓冲：写不出去的消息压着，重连后补发——
+  少了它，断线那十几秒渲完的帧不记账，重连后会被重跑并覆盖输出。
+- **按机器速度加权**：`meta.perf` 两级键 `job|host` 与 `job`，
+  权重 = `中位帧耗时 / 本机帧耗时`（clamp 0.25–4）；只有 ≥2 台有实测才加权，否则平均分。
+- **机器标签落库**：`jobs.host`（逗号分隔）。卡片显示靠 `Rt.hosts`，启动时从库里读回。
 - **没挂 Hub 时整条多机路径不执行**，单机行为与旧版完全一致（改动时守住这条）。
 
 worker 侧两个坑：
@@ -252,9 +270,12 @@ cargo build --release    # 产物 target/release/houdini-render-queue.exe
 --debug-invoke clear-finished|restart-all          直接触发回调，做回归
 --debug-invoke worker-slots:<id>:<n>               调某台 worker 的槽位（同设备面板 +/-）
 --debug-invoke worker-pause:<id>:<0|1>             停用/启用某台 worker
+--debug-invoke toggle-multi                       点一次「开启/关闭多机」（配合 --snapshot 回归）
 --debug-invoke-delay <ms>                          推迟上面这条的触发时间（多机要等 worker 连上）
---listen [端口]                                    开多机监听（默认 7878），不起就不走多机路径
---worker --connect <host:port> [--slots n]         当执行端（不初始化界面/数据库）
+--listen [端口]                                    启动即开多机监听（默认 7878）；平时用面板开关
+--token <口令>                                     多机口令；不给则用 meta.multi_token / 新生成
+--worker --connect <host:port|auto> [--slots n]    当执行端（不初始化界面/数据库）；auto = 广播发现
+--net-info                                         打印本机 IP / 端口 / 口令 / worker 命令后退出
 --devices-open                                     启动即展开设备面板，配合 --snapshot 回归
 ```
 

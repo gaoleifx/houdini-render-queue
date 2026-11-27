@@ -89,7 +89,9 @@ class Node:
                 os.makedirs(d, exist_ok=True)
             with open(path, "wb") as f:
                 f.write(b"fake")
-        time.sleep(0.08)
+        # 单帧耗时可用环境变量放大：联调「主控重启后接管」这类时序场景时，
+        # 默认 80ms 的假渲染跑得太快，块还没跑完主控就重启好了，测不到接管
+        time.sleep(float(os.environ.get("HRQ_FAKE_FRAME_SEC", "0.08")))
 
 
 class SopNode(Node):

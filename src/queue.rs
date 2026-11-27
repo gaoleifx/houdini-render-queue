@@ -31,6 +31,8 @@ pub enum Cmd {
     SetRetries(u32),
     /// 主界面起好监听后把 Hub 交给引擎（之后才可能出现远端块）
     AttachHub(Arc<Hub>, Receiver<HubEvent>),
+    /// 关掉多机：在跑的远端块作废，帧退回队列（UI 开关用）
+    DetachHub,
     /// 设备面板打开时主动要一份快照
     RefreshWorkers,
     /// 单台 worker 调并发槽
@@ -73,6 +75,58 @@ impl Perf {
     }
 }
 
+/// perf 表的两级键：`job|host` 是「这台机器跑这个任务」的实测，`job` 是泛化值。
+/// 有了前者才能按机器快慢分活——同一份 hip 在 Z8 和旧机器上单帧能差三倍。
+fn perf_key(job: &str, host: &str) -> String {
+    format!("{job}|{host}")
+}
+
+fn frame_ms_for(perf: &HashMap<String, Perf>, job: &str, host: &str) -> Option<f64> {
+    perf.get(&perf_key(job, host))
+        .map(|p| p.frame_ms)
+        .or_else(|| perf.get(job).map(|p| p.frame_ms))
+        .filter(|v| *v > 0)
+        .map(|v| v as f64)
+}
+
+/// 这个任务「值得单独开一次 hython」的门槛。优先用实测；
+/// 没有 job 级数据时取各机器里**最大**的那个——门槛取小会让块切得更碎，
+/// 一不小心就变成「算 3 帧、加载 60 秒」，所以宁可保守。
+fn min_chunk_for(perf: &HashMap<String, Perf>, job: &str) -> usize {
+    if let Some(p) = perf.get(job) {
+        return p.min_frames();
+    }
+    let prefix = format!("{job}|");
+    perf.iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, p)| p.min_frames())
+        .max()
+        .unwrap_or(8)
+}
+
+/// 各机器的速度权重（越大越快，拿到的帧越多）。
+///
+/// 只有一台有实测时没法比较，一律平均分——单台机器上「它的权重是 1」和
+/// 「它的权重是 0.7」对结果没区别，而跟没有实测的机器混着比会凭空压低它。
+fn speed_weights(perf: &HashMap<String, Perf>, job: &str, hosts: &[String]) -> Vec<f64> {
+    let known: Vec<f64> = hosts
+        .iter()
+        .filter_map(|h| frame_ms_for(perf, job, h))
+        .collect();
+    if known.len() < 2 || known.len() != hosts.len() {
+        return vec![1.0; hosts.len()];
+    }
+    let mut sorted = known.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    hosts
+        .iter()
+        .filter_map(|h| frame_ms_for(perf, job, h))
+        // 差 4 倍封顶：机器型号差异不该让一台机器独占整个任务
+        .map(|ms| (median / ms).clamp(0.25, 4.0))
+        .collect()
+}
+
 enum WMsg {
     Frame(String, i32),
     Done(String, WResult, Perf),
@@ -95,12 +149,12 @@ struct Rt {
     local: BTreeSet<i32>,
     /// 在跑的远端块 → 该块的帧，块结束时整块回滚或确认
     blocks: HashMap<String, Vec<i32>>,
-    /// 已经为这个任务做过一次「对半分」。只在第一次生效：否则本地会
-    /// 100→50→25→13→6 一路对半切下去，每段都要重开一次 hython，加载开销爆炸。
-    paced: bool,
-    /// 刚在这个任务上失败的 worker。重试时避开它们——不然同一块会被派回同一台，
-    /// 一路重试一路失败，直到 attempts 用完
-    avoid: HashSet<usize>,
+    /// 刚在这个任务上失败的机器（主机名）。重试时避开它们——不然同一块会被派回同一台，
+    /// 一路重试一路失败，直到 attempts 用完。
+    ///
+    /// 记主机名而不是连接 id：worker 断线重连会拿到新 id，按 id 记的话「换机重试」
+    /// 在它重连后立刻失效。
+    avoid: HashSet<String>,
     /// 跑过这个任务的机器名（本机也记）。纯展示用，卡片上那枚标签
     hosts: BTreeSet<String>,
 }
@@ -119,7 +173,6 @@ impl Rt {
             remote: BTreeSet::new(),
             local: BTreeSet::new(),
             blocks: HashMap::new(),
-            paced: false,
             avoid: HashSet::new(),
             hosts: BTreeSet::new(),
         }
@@ -193,6 +246,17 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
         .get_meta("perf")
         .and_then(|s| serde_json::from_str::<HashMap<String, Perf>>(&s).ok())
         .unwrap_or_default();
+    // 上次是哪几台机器跑的：卡片上的机器标签要跨重启活着（否则历史任务看不出执行机器）
+    {
+        let saved = db.load_job_hosts();
+        for r in rt.iter_mut() {
+            if let Some(h) = saved.get(&r.spec.id) {
+                for part in h.split(',').filter(|p| !p.is_empty()) {
+                    r.hosts.insert(part.to_string());
+                }
+            }
+        }
+    }
 
     let _ = evt.send(Event::Queue(snapshot(&rt)));
 
@@ -325,7 +389,6 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                             r.attempts = 0;
                             r.message.clear();
                             r.done.clear();
-                            r.paced = false;
                             r.avoid.clear();
                             r.hosts.clear();
                             db.clear_frames(&r.spec.id);
@@ -363,6 +426,36 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         format!("多机执行已就绪（当前在线 {n} 台），可分片任务会按帧块派发"),
                     );
                 }
+                Cmd::DetachHub => {
+                    // 多机被关掉：在跑的块全部退回队列（worker 那头很快会发现连接断了，
+                    // 它会自己重连，但主控已经不接了）
+                    let mut back = 0usize;
+                    for r in rt.iter_mut() {
+                        if r.blocks.is_empty() {
+                            continue;
+                        }
+                        let blocks = std::mem::take(&mut r.blocks);
+                        for frames in blocks.values() {
+                            for f in frames {
+                                r.remote.remove(f);
+                            }
+                            back += frames.len();
+                            if !r.detached
+                                && matches!(r.status, JobStatus::Queued | JobStatus::Running)
+                            {
+                                r.status = JobStatus::Queued;
+                                r.message = format!("多机已关闭，{} 帧退回队列", frames.len());
+                            }
+                        }
+                    }
+                    hub = None;
+                    hub_rx = None;
+                    let _ = evt.send(Event::Workers(Vec::new()));
+                    let _ = evt.send(Event::Queue(snapshot(&rt)));
+                    if back > 0 {
+                        log(&evt, format!("多机已关闭，{back} 帧退回本地队列"));
+                    }
+                }
                 Cmd::RefreshWorkers => {
                     if let Some(h) = &hub {
                         let _ = evt.send(Event::Workers(h.views()));
@@ -397,7 +490,6 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     let ord = rt.iter().position(|x| x.spec.id == id).unwrap_or(0) as i64;
                     if let Some(r) = rt.iter_mut().find(|r| r.spec.id == id) {
                         r.spec.sequential = seq;
-                        r.paced = false;
                         db.save_job(&r.spec, ord, r.status, r.attempts);
                         log(
                             &evt,
@@ -532,7 +624,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     HubEvent::Done {
                         job,
                         chunk,
-                        worker,
+                        worker: _,
                         host,
                         kind,
                         detail,
@@ -546,7 +638,11 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                             }
                             let title = r.spec.title();
                             r.hosts.insert(host.clone());
+                            persist_hosts(&db, &r.spec.id, &r.hosts);
                             if boot_ms > 0 && frame_ms > 0 {
+                                // 两处都记：`job|host` 用来按机器快慢分活，
+                                // `job` 保持泛化值（老库里只有这一种）
+                                perf.insert(perf_key(&job, &host), Perf { boot_ms, frame_ms });
                                 perf.insert(job.clone(), Perf { boot_ms, frame_ms });
                                 save_perf(&db, &perf);
                             }
@@ -557,7 +653,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                                 match kind {
                                     DoneKind::Ok => {
                                         // 这台上过了就没问题，之前拉黑的记录作废
-                                        r.avoid.remove(&worker);
+                                        r.avoid.remove(&host);
                                         if r.all_done() {
                                             r.status = JobStatus::Success;
                                             r.message.clear();
@@ -583,8 +679,8 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                                         r.attempts += 1;
                                         // 下次重试别再派回这台：同一块在同一台反复失败
                                         // 是 attempts 被白白烧完的最常见原因
-                                        if worker > 0 {
-                                            r.avoid.insert(worker);
+                                        if !host.is_empty() {
+                                            r.avoid.insert(host.clone());
                                         }
                                         let what = if detail.is_empty() {
                                             "分片执行失败".to_string()
@@ -614,7 +710,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         changed = true;
                     }
                     HubEvent::Offline {
-                        worker,
+                        worker: _,
                         host,
                         running,
                     } => {
@@ -628,13 +724,13 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                             for f in &frames {
                                 r.remote.remove(f);
                             }
-                            r.avoid.insert(worker);
+                            if !host.is_empty() {
+                                r.avoid.insert(host.clone());
+                            }
                             if frames.is_empty() {
                                 continue;
                             }
                             if !r.detached && matches!(r.status, JobStatus::Queued | JobStatus::Running) {
-                                // 别再切碎：接着按大块跑，少一次无谓的 hip 加载
-                                r.paced = true;
                                 r.status = if r.running || !r.blocks.is_empty() {
                                     JobStatus::Running
                                 } else {
@@ -656,7 +752,51 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         }
                         changed = true;
                     }
-                    HubEvent::Online(_) | HubEvent::Changed => {
+                    HubEvent::Resumed {
+                        job,
+                        chunk,
+                        frames,
+                        host,
+                    } => {
+                        // 主控重启 / worker 重连后它手上那块还在跑：这些帧必须记成
+                        // 「远端已认领」，否则本地会把它们再渲一遍，两个进程抢同一个输出文件
+                        if let Some(r) = rt.iter_mut().find(|r| r.spec.id == job) {
+                            if !r.blocks.contains_key(&chunk) {
+                                r.hosts.insert(host.clone());
+                                r.remote.extend(frames.iter().copied());
+                                r.blocks.insert(chunk.clone(), frames.clone());
+                                if r.status == JobStatus::Queued {
+                                    r.status = JobStatus::Running;
+                                }
+                            }
+                        }
+                        changed = true;
+                    }
+                    HubEvent::Stopped => {
+                        log(&evt, "多机已关闭，正在跑的远端块交回本地".into());
+                        changed = true;
+                    }
+                    HubEvent::Online(v) => {
+                        // 重连回来的机器解除之前的拉黑：它可能刚修好挂载/许可证，
+                        // 一直记着等于这台机器再也接不到这个任务
+                        let mut freed = 0;
+                        for r in rt.iter_mut() {
+                            if r.avoid.remove(&v.host) {
+                                freed += 1;
+                            }
+                        }
+                        if freed > 0 {
+                            log(
+                                &evt,
+                                format!("{} 重新上线，解除 {} 个任务对它的回避", v.host, freed),
+                            );
+                        }
+                        if let Some(h) = &hub {
+                            let _ = evt.send(Event::Workers(h.views()));
+                        }
+                        changed = true;
+                    }
+                    HubEvent::Changed => {
                         // 设备面板的数据走单独的快照，这里只驱动一次重排
                         if let Some(h) = &hub {
                             let _ = evt.send(Event::Workers(h.views()));
@@ -711,28 +851,41 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     // 下限 `min_frames` 来自实测：一次 hip 加载可能要几十秒到几分钟，
                     // 切出来的块如果小到「算 3 帧、加载 60 秒」，多机反而比单机慢。
                     // 这个数一开始是经验值 8，跑过一次后就按真实耗时算了（见 Perf）。
-                    let min_chunk = perf.get(&rt[idx].spec.id).map(|p| p.min_frames()).unwrap_or(8);
+                    let job_id = rt[idx].spec.id.clone();
+                    let min_chunk = min_chunk_for(&perf, &job_id);
+                    let exclude: Vec<String> = rt[idx].avoid.iter().cloned().collect();
+                    let mut req = AssignReq {
+                        job: job_id.clone(),
+                        chunk: String::new(),
+                        hip: rt[idx].spec.hip.to_string_lossy().to_string(),
+                        node: rt[idx].spec.node_path.clone(),
+                        houdini: rt[idx].spec.houdini.clone(),
+                        output: rt[idx].spec.output.clone(),
+                        frames: Vec::new(),
+                        exclude,
+                    };
+                    // 按机器快慢分配份额：快的多拿。权重列表第 0 台正是 dispatch 会选中的那台。
+                    let hosts = h.idle_hosts_for(&req);
                     let size = if is_splittable(&rt[idx].spec)
-                        && !rt[idx].paced
                         && shares > 1
-                        && remain >= min_chunk * 2
+                        && remain >= min_chunk * shares * 2
                     {
-                        remain.div_ceil(shares).max(min_chunk)
+                        let ws = speed_weights(&perf, &job_id, &hosts);
+                        let frac = if ws.len() >= 2 {
+                            let total: f64 = ws.iter().sum();
+                            if total > 0.0 { ws[0] / total } else { 1.0 / shares as f64 }
+                        } else {
+                            1.0 / shares as f64
+                        };
+                        let want = ((remain as f64) * frac).ceil() as usize;
+                        want.clamp(min_chunk, remain)
                     } else {
                         remain
                     };
                     let take: Vec<i32> = free.into_iter().take(size).collect();
                     let chunk = block_name(&take);
-                    let req = AssignReq {
-                        job: rt[idx].spec.id.clone(),
-                        chunk: chunk.clone(),
-                        hip: rt[idx].spec.hip.to_string_lossy().to_string(),
-                        node: rt[idx].spec.node_path.clone(),
-                        houdini: rt[idx].spec.houdini.clone(),
-                        output: rt[idx].spec.output.clone(),
-                        frames: take.clone(),
-                        exclude: rt[idx].avoid.iter().copied().collect(),
-                    };
+                    req.chunk = chunk.clone();
+                    req.frames = take.clone();
                     // dispatch 失败说明没有匹配的机器（版本不符 / 拒绝过），别死循环
                     let Some(t) = h.dispatch(&req) else { break };
 
@@ -749,7 +902,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     rt[idx].remote.extend(take.iter().copied());
                     rt[idx].blocks.insert(chunk, take);
                     rt[idx].hosts.insert(t.host.clone());
-                    rt[idx].paced = true;
+                    persist_hosts(&db, &rt[idx].spec.id, &rt[idx].hosts);
                     if rt[idx].status == JobStatus::Queued {
                         rt[idx].status = JobStatus::Running;
                     }
@@ -792,20 +945,17 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                 // 行为与旧版完全一致。切走的量同样不能低于「值得重开一次 hython」的门槛。
                 let mut frames = rt[idx].free_frames();
                 let remote_online = hub.as_ref().map(|h| h.online_count() > 0).unwrap_or(false);
-                let min_chunk = perf.get(&rt[idx].spec.id).map(|p| p.min_frames()).unwrap_or(8);
-                if remote_online
-                    && !rt[idx].paced
-                    && frames.len() >= min_chunk * 2
-                    && is_splittable(&rt[idx].spec)
-                {
+                let min_chunk = min_chunk_for(&perf, &rt[idx].spec.id);
+                if remote_online && frames.len() >= min_chunk * 2 && is_splittable(&rt[idx].spec) {
+                    // 远端还空着，本地只拿一半，剩下的留在池子里给它
                     frames.truncate(frames.len().div_ceil(2));
-                    rt[idx].paced = true;
                 }
 
                 rt[idx].running = true;
                 rt[idx].status = JobStatus::Running;
                 rt[idx].cancel = Arc::new(AtomicBool::new(false));
                 rt[idx].hosts.insert("本机".into());
+                persist_hosts(&db, &rt[idx].spec.id, &rt[idx].hosts);
                 // 这些帧已交给本地线程：远端不能再派同一帧
                 rt[idx].local.extend(frames.iter().copied());
 
@@ -907,6 +1057,12 @@ fn save_perf(db: &Db, perf: &HashMap<String, Perf>) {
     if let Ok(s) = serde_json::to_string(perf) {
         db.set_meta("perf", &s);
     }
+}
+
+/// 机器标签落库：重启后卡片上还能看出这任务是哪几台跑的。
+fn persist_hosts(db: &Db, id: &str, hosts: &BTreeSet<String>) {
+    let joined: Vec<&str> = hosts.iter().map(String::as_str).collect();
+    db.set_job_host(id, &joined.join(","));
 }
 
 fn snapshot(rt: &[Rt]) -> Vec<JobView> {
@@ -1276,5 +1432,62 @@ mod tests {
         let mut one = BTreeSet::new();
         one.insert("RENDER-FARM-NODE-007".to_string());
         assert_eq!(host_label(&one), "RENDER-FAR…");
+    }
+
+    /// `job|host` 是「这台机器跑这个任务」的实测，`job` 是泛化值。
+    /// 有前者就用前者，否则退回后者——老库里只有 `job` 一种键。
+    #[test]
+    fn perf_prefers_per_host_then_falls_back() {
+        let mut perf = HashMap::new();
+        perf.insert("j".to_string(), Perf { boot_ms: 10_000, frame_ms: 1_000 });
+        assert_eq!(frame_ms_for(&perf, "j", "WS-02"), Some(1_000.0));
+
+        perf.insert(
+            perf_key("j", "WS-02"),
+            Perf { boot_ms: 10_000, frame_ms: 200 },
+        );
+        assert_eq!(frame_ms_for(&perf, "j", "WS-02"), Some(200.0));
+        // 别的机器仍然用泛化值
+        assert_eq!(frame_ms_for(&perf, "j", "WS-03"), Some(1_000.0));
+        assert_eq!(frame_ms_for(&perf, "别的任务", "WS-02"), None);
+    }
+
+    /// 快的机器权重大、该多拿帧；差 4 倍封顶，避免一台机器吃光整个任务。
+    #[test]
+    fn speed_weights_favor_faster_hosts() {
+        let mut perf = HashMap::new();
+        perf.insert(perf_key("j", "FAST"), Perf { boot_ms: 1_000, frame_ms: 100 });
+        perf.insert(perf_key("j", "SLOW"), Perf { boot_ms: 1_000, frame_ms: 400 });
+        let hosts = vec!["FAST".to_string(), "SLOW".to_string()];
+        let w = speed_weights(&perf, "j", &hosts);
+        assert!(w[0] > w[1], "快的应该权重大：{w:?}");
+        assert!((w[0] - 4.0).abs() < 1e-6, "400/100 = 4 倍：{w:?}");
+
+        // 差 20 倍也只给 4 倍，且权重按中位数归一
+        perf.insert(perf_key("j", "TINY"), Perf { boot_ms: 1_000, frame_ms: 5 });
+        let w = speed_weights(&perf, "j", &hosts);
+        assert!(w[0] <= 4.0 && w[0] >= 0.25);
+    }
+
+    /// 只有一台有实测（或都没有）时，没法横向比较：平均分，别凭空压低。
+    #[test]
+    fn speed_weights_are_equal_without_comparison() {
+        let mut perf = HashMap::new();
+        perf.insert(perf_key("j", "ONLY"), Perf { boot_ms: 1_000, frame_ms: 100 });
+        let hosts = vec!["ONLY".to_string(), "NEW".to_string()];
+        assert_eq!(speed_weights(&perf, "j", &hosts), vec![1.0, 1.0]);
+        assert_eq!(speed_weights(&perf, "j", &[]), Vec::<f64>::new());
+    }
+
+    /// 分片下限只看实测；没有 job 级数据时取各机器里最保守（最大）的那个。
+    #[test]
+    fn min_chunk_uses_conservative_floor() {
+        let mut perf = HashMap::new();
+        perf.insert(perf_key("j", "A"), Perf { boot_ms: 60_000, frame_ms: 5_000 }); // 18 帧
+        perf.insert(perf_key("j", "B"), Perf { boot_ms: 30_000, frame_ms: 5_000 }); // 9 帧
+        assert_eq!(min_chunk_for(&perf, "j"), 18);
+        perf.insert("j".to_string(), Perf { boot_ms: 60_000, frame_ms: 6_000 }); // 15 帧
+        assert_eq!(min_chunk_for(&perf, "j"), 15);
+        assert_eq!(min_chunk_for(&perf, "没跑过"), 8);
     }
 }

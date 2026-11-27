@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use slint::{Model, ModelRc, VecModel};
@@ -1235,8 +1235,9 @@ fn arg_value(flag: &str) -> Option<String> {
 
 /// 判定是不是 worker 角色；是就返回主控地址。
 ///
-/// 三种写法都认：`--worker 1.2.3.4:7878`、`--worker --connect 1.2.3.4:7878`、
-/// 单独 `--connect 1.2.3.4:7878`。都没有地址时回落到本机默认端口。
+/// 四种写法都认：`--worker 1.2.3.4:7878`、`--worker --connect 1.2.3.4:7878`、
+/// 单独 `--connect 1.2.3.4:7878`、`--worker --connect auto`（广播自动找主控）。
+/// 只写 `--worker` 不带地址时同样走自动发现。
 fn worker_target() -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     let is_worker = args.iter().any(|a| a == "--worker") || args.iter().any(|a| a == "--connect");
@@ -1251,9 +1252,31 @@ fn worker_target() -> Option<String> {
             }
         }
     }
-    Some(
-        arg_value("--connect").unwrap_or_else(|| format!("127.0.0.1:{}", remote::DEFAULT_PORT)),
-    )
+    Some(arg_value("--connect").unwrap_or_else(|| "auto".into()))
+}
+
+/// 接入口令。主控没给就用空串（不校验，仅限内网调试）。
+fn token_of_args() -> String {
+    arg_value("--token").unwrap_or_default()
+}
+
+/// 自动生成一个 6 位口令，避免「谁都能连上来领活」。用时间 + pid 混一下就行——
+/// 这不是防破解，只是防同网段里另一个人的程序误连/乱连。
+fn gen_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let mut v = nanos.wrapping_mul(1_103_515_245).wrapping_add(pid * 2654435761);
+    const ALPHA: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut out = String::new();
+    for _ in 0..6 {
+        v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.push(ALPHA[(v >> 33) as usize % ALPHA.len()] as char);
+    }
+    out
 }
 
 /// 主控监听端口。没给 `--listen` 就不开多机，单机行为与以前一模一样。
@@ -1274,7 +1297,35 @@ fn main() -> Result<(), slint::PlatformError> {
         let slots = arg_value("--slots")
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(1);
-        remote::run_worker_role(&addr, slots);
+        remote::run_worker_role(&addr, slots, &token_of_args());
+    }
+
+    // 调试用：打印本机的多机接入信息（IP / 端口 / 口令）后退出。真机联调时
+    // 在 worker 机上跑它，比到处找 IP 快。
+    if std::env::args().any(|a| a == "--net-info") {
+        let port = listen_port().unwrap_or(remote::DEFAULT_PORT);
+        let token = token_of_args();
+        match remote::lan_ip() {
+            Some(ip) => println!("本机局域网地址：{ip}"),
+            None => println!("没检测到局域网地址（网线没插 / 只有回环）"),
+        }
+        println!("监听端口：{port}");
+        println!(
+            "口令：{}",
+            if token.is_empty() {
+                "（未设置，谁都能连）".to_string()
+            } else {
+                token.clone()
+            }
+        );
+        println!(
+            "其他机器运行：houdini-render-queue.exe --worker --connect {}:{port} --token {}",
+            remote::lan_ip()
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "<本机IP>".into()),
+            if token.is_empty() { "<口令>" } else { &token }
+        );
+        return Ok(());
     }
 
     // 调试用：只打印 hip 版本识别结果并退出，不起界面
@@ -1386,27 +1437,97 @@ fn main() -> Result<(), slint::PlatformError> {
         );
     }
 
-    // 多机执行：只有显式给 --listen 才开监听，不带这个参数时一切照旧（纯单机）
-    ui.set_device_hint("未开启多机：用 --listen [端口] 启动，其他机器即可接入".into());
-    if let Some(port) = listen_port() {
-        match remote::Hub::start(port) {
-            Ok((hub, hrx)) => {
-                app.borrow().engine.send(Cmd::AttachHub(hub, hrx));
-                ui.set_device_hint(
-                    format!(
-                        "监听 0.0.0.0:{port} · 其他机器运行：houdini-render-queue.exe --worker --connect <本机IP>:{port}"
-                    )
-                    .into(),
-                );
-            }
-            Err(e) => {
-                let mut a = app.borrow_mut();
-                push_log(
-                    &mut a,
-                    format!("{}  多机监听失败（端口 {port}）：{e}", pyproc::now_hms()),
-                );
+    // 多机执行：默认不开。设备面板里一键开启（不用记命令行参数）；带 `--listen`
+    // 启动则自动开。口令没给就自动生成一个，避免同网段的人随手连上来领活。
+    let multi: Rc<RefCell<Option<Arc<remote::Hub>>>> = Rc::new(RefCell::new(None));
+    let multi_port = listen_port().unwrap_or(remote::DEFAULT_PORT);
+    let multi_token = {
+        let t = token_of_args();
+        if !t.is_empty() {
+            t
+        } else {
+            // 口令要跨重启固定：每次开程序都换一个的话，worker 那边存的旧口令
+            // 会被判成「口令不对」直接退出，主控一重启整批机器全掉线。
+            let saved = app.borrow().ui_db.get_meta("multi_token").unwrap_or_default();
+            if !saved.is_empty() {
+                saved
+            } else {
+                let t = gen_token();
+                app.borrow().ui_db.set_meta("multi_token", &t);
+                t
             }
         }
+    };
+    ui.set_multi_on(false);
+    ui.set_device_hint(
+        "多机未开启：点「开启多机」，其他机器即可接入（默认端口 7878）".into(),
+    );
+
+    let start_multi: Rc<dyn Fn()> = {
+        let ui_weak = ui.as_weak();
+        let app = app.clone();
+        let multi = multi.clone();
+        let token = multi_token.clone();
+        Rc::new(move || {
+            if multi.borrow().is_some() {
+                return;
+            }
+            match remote::Hub::start(multi_port, &token) {
+                Ok((hub, hrx)) => {
+                    app.borrow().engine.send(Cmd::AttachHub(hub.clone(), hrx));
+                    *multi.borrow_mut() = Some(hub.clone());
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_multi_on(true);
+                        ui.set_device_hint(
+                            format!("监听 0.0.0.0:{multi_port} · worker：{}", hub.join_hint())
+                                .into(),
+                        );
+                    }
+                    push_log(
+                        &mut app.borrow_mut(),
+                        format!(
+                            "{}  多机已开启：端口 {multi_port}，口令 {token}（设备面板里能复制接入命令）",
+                            pyproc::now_hms()
+                        ),
+                    );
+                }
+                Err(e) => {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_device_hint(format!("端口 {multi_port} 打不开：{e}").into());
+                    }
+                    push_log(
+                        &mut app.borrow_mut(),
+                        format!("{}  多机监听失败（端口 {multi_port}）：{e}", pyproc::now_hms()),
+                    );
+                }
+            }
+        })
+    };
+
+    let stop_multi: Rc<dyn Fn()> = {
+        let ui_weak = ui.as_weak();
+        let app = app.clone();
+        let multi = multi.clone();
+        Rc::new(move || {
+            let Some(hub) = multi.borrow_mut().take() else {
+                return;
+            };
+            hub.stop();
+            app.borrow().engine.send(Cmd::DetachHub);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_multi_on(false);
+                ui.set_device_hint("多机未开启：点「开启多机」重新接入".into());
+            }
+            push_log(
+                &mut app.borrow_mut(),
+                format!("{}  多机已关闭（对方会自己重连，但不会再被接进来）", pyproc::now_hms()),
+            );
+        })
+    };
+
+    // `--listen` 给了就启动即开，保持脚本化用法
+    if listen_port().is_some() {
+        start_multi();
     }
 
     {
@@ -1933,6 +2054,21 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     {
+        // 设备面板上的「开启 / 关闭多机」。不用记命令行参数：端口和口令都在 Rust 侧
+        let ui_weak = ui.as_weak();
+        let start = start_multi.clone();
+        let stop = stop_multi.clone();
+        ui.on_toggle_multi(move || {
+            let on = ui_weak.upgrade().map(|u| u.get_multi_on()).unwrap_or(false);
+            if on {
+                stop();
+            } else {
+                start();
+            }
+        });
+    }
+
+    {
         let app = app.clone();
         ui.on_task_sequential(move |id| {
             let mut a = app.borrow_mut();
@@ -2271,6 +2407,8 @@ fn main() -> Result<(), slint::PlatformError> {
                             let p = parts.next().map(|s| s == "1").unwrap_or(true);
                             ui.invoke_worker_pause(id, p);
                         }
+                        "toggle-multi" => ui.invoke_toggle_multi(),
+                        "toggle-devices" => ui.invoke_toggle_devices(),
                         other => eprintln!("未知的调试回调: {other}"),
                     }
                 }

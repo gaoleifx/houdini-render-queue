@@ -586,7 +586,11 @@ export component AppWindow inherits Window {
     in-out property <string> device-label: "设备";
     /// 面板底部那行提示（监听地址 / 未开启时的说明）
     in-out property <string> device-hint: "";
+    /// 多机是否已开启（决定按钮文字）
+    in-out property <bool> multi-on: false;
     callback toggle-devices();
+    /// 开启 / 关闭多机（主控侧监听）
+    callback toggle-multi();
     /// 调某台 worker 的并发槽：参数是 (worker id, 目标槽数)
     callback worker-slots(int, int);
     /// 停用 / 启用某台 worker
@@ -1390,6 +1394,24 @@ export component AppWindow inherits Window {
                     }
 
                     Rule { }
+                    // 多机开关：不用记 --listen 参数，点一下就能让别的机器接入
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: root.multi-on ? "多机已开启，等待其他机器接入" : "多机未开启（只在本机跑）";
+                            font-size: Fonts.size(10.5px);
+                            color: root.multi-on ? Theme.text-2 : Theme.text-3;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        Chip {
+                            label: root.multi-on ? "关闭多机" : "开启多机";
+                            w: 72px;
+                            active: root.multi-on;
+                            clicked => { root.toggle-multi(); }
+                        }
+                    }
                     Text {
                         text: root.device-hint;
                         font-size: Fonts.size(10px);

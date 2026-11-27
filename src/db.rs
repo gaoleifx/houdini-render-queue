@@ -94,6 +94,12 @@ impl Db {
                 "ALTER TABLE jobs ADD COLUMN sequential INTEGER NOT NULL DEFAULT 0",
             );
         }
+        // 老库补列：jobs.host（哪几台机器跑过，逗号分隔；多机之前只有本机）
+        if !self.has_column("jobs", "host") {
+            let _ = self
+                .conn
+                .execute_batch("ALTER TABLE jobs ADD COLUMN host TEXT NOT NULL DEFAULT ''");
+        }
         Ok(())
     }
 
@@ -268,8 +274,33 @@ impl Db {
         let _ = tx.commit();
     }
 
-    pub fn delete_job(&self, id: &str) {
-        let _ = self.conn.execute("DELETE FROM jobs WHERE id=?1", params![id]);
+    /// 记「这个任务是哪几台机器跑的」。逗号分隔（卡片的机器标签只有两种形态：
+    /// 单台名字 / 「多机 N」，所以不必拆表）。
+    pub fn set_job_host(&self, id: &str, host: &str) {
+        let _ = self
+            .conn
+            .execute("UPDATE jobs SET host=?2 WHERE id=?1", params![id, host]);
+    }
+
+    /// 启动时把上一次的机器标签读回来。
+    pub fn load_job_hosts(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let Ok(mut stmt) = self.conn.prepare("SELECT id, host FROM jobs") else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            for (id, host) in rows.flatten() {
+                if !host.is_empty() {
+                    out.insert(id, host);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn delete_job(&self, id: &str) {        let _ = self.conn.execute("DELETE FROM jobs WHERE id=?1", params![id]);
         let _ = self
             .conn
             .execute("DELETE FROM frames WHERE job_id=?1", params![id]);
