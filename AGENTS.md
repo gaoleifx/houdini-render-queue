@@ -47,6 +47,7 @@ src/analyze.rs    152 行，起 hython 跑 analyze.py，截取 JSON，带超时
 src/houdini.rs    154 行，扫安装目录找 hython；读 hip 头部 `_HIP_SAVEVERSION` 得到制作版本
 src/windrop.rs    724 行，OLE 拖放 + 窗口子类化（双击 / 大图标）
 src/pyproc.rs      55 行，脚本路径定位 + 隐藏窗口的 Command
+src/remote.rs    约 900 行，局域网多机：NDJSON 行协议 + master 侧 Hub + worker 角色
 src/snap.rs        43 行，`--snapshot` 截图（调试用）
 src/fonts.rs      约 150 行，枚举本机系统字体（fontdb），给字体设置下拉框用
 
@@ -107,6 +108,40 @@ dist/            可分发产物（exe + python/），改完要手动同步
   老版本是 `[起, 止]` 数组，`load_ranges()` 两种都认）
 
 启动时读库重建队列；上次退出时处于 `running` 的任务会回落到 `queued`（进程已经没了）。
+
+### 4.4 多机执行（局域网，2026.2 起）
+
+设计文档在 `docs/multi-machine.md`，实现是 `src/remote.rs` + `queue.rs` 里几处钩子。
+
+```
+主控（就是主界面）--listen 7878  →  起 Hub，TcpListener + 在线 worker 池
+worker（同一 exe --worker --connect host:port）→ 主动拨号，收活、起本机 hython 跑 render.py
+```
+
+要点：
+
+- **粒度是帧块**，不是逐帧：一块一个 hython 进程，`render.py` 一行没改。
+- **派发前校验**：worker 收到 `assign` 先查 `hip` 是否存在、本机有没有对应版本的 hython，
+  不满足就 `reject`，主控换一台。路径/版本问题在起进程前暴露。
+- **乐观占用**：`dispatch` 发出去就把槽算忙，收到 `reject` 再退回来（不维护"已发未回"状态机）。
+- **只有主控写数据库**：worker 的 `##DONE` 通过 `HubEvent::Frame` 回到引擎线程统一落库。
+  共享盘上的 SQLite + WAL 跨 SMB 会坏。
+- **`Rt` 里的三个帧集合必须分清**（漏一个就会重复执行或漏跑）：
+  - `done` 已完成
+  - `remote` 已派给远端、还没回报
+  - `local` 已交给本地线程、还没完成
+  `free_frames()` = 全集 − 三者。
+- **`paced` 标记**：任务第一次分片时「对半分」，之后谁拿都是整包剩余。不加这个标记，
+  本地会 100→50→25→13→6 一路对半切，每段都重开一次 hython，加载开销把并行收益吃光。
+- **`is_splittable`**：只看输出路径是否含 `$F`/`${F`。写单文件（mov、单个 usd）的任务必须整包派一台。
+- **没挂 Hub 时整条多机路径不执行**，单机行为与旧版完全一致（改动时守住这条）。
+
+worker 侧两个坑：
+
+- release 是 `windows_subsystem = "windows"`，双击起 worker 没有控制台 →
+  `ensure_console()` 先 `AttachConsole(-1)` 再 `AllocConsole()`，日志另写 `%TEMP%\HoudiniRenderQueue\worker.log`。
+- `HRQ_HYTHON` 指定的 hython 版本号可能是「自定义1」这类标签，`pick_install` 让它**优先于版本匹配**；
+  同时 `same_minor` 只认纯数字版本串，否则 `20.5.684-fake` 会匹配到真实的 `20.5.684`。
 
 ---
 
@@ -204,6 +239,9 @@ cargo build --release    # 产物 target/release/houdini-render-queue.exe
 --probe-window                                     打印根元素 layout-info（窗口拖不动时先看 min 是否等于 max）
 --list-fonts                                       打印枚举到的系统字体（带序号）后退出
 --debug-invoke clear-finished|restart-all          直接触发回调，做回归
+--listen [端口]                                    开多机监听（默认 7878），不起就不走多机路径
+--worker --connect <host:port> [--slots n]         当执行端（不初始化界面/数据库）
+--devices-open                                     启动即展开设备面板，配合 --snapshot 回归
 ```
 
 字体这块的两个坑（`src/fonts.rs`）：枚举用 `fontdb`（Slint 内部查字体用的同一个库），

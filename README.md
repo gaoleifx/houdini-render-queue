@@ -67,7 +67,42 @@ python tools/peek_icon.py dist/houdini-render-queue.exe check.png   # 校验 exe
 --font-filter <词>       调试：预置字体搜索词
 --list-fonts             调试：打印枚举到的系统字体（含序号）后退出
 --debug-invoke <回调名>  调试：直接触发一次按钮回调（clear-finished / restart-all），配合 --snapshot 做回归
+--listen [端口]          开启多机：本机当主控监听（默认 7878）
+--worker --connect <地址> 当执行端，连到主控干活（不显示界面）
+--slots <n>              worker 的并发槽位，默认 1
+--devices-open           调试：启动即展开设备面板，配合 --snapshot 做回归
 ```
+
+## 多机渲染（局域网）
+
+主控还是这个程序，其他机器只当执行端。**前提是工程和资源都在共享盘上、
+用同一套路径（推荐 UNC，如 `\\NAS\proj\...`）**，否则别的机器打不开 hip。
+
+在主力机上开监听：
+
+```
+houdini-render-queue.exe --listen 7878
+```
+
+每台参与渲染的机器（同一个 exe + `python/` 目录）跑：
+
+```
+houdini-render-queue.exe --worker --connect 192.168.1.10:7878
+```
+
+worker 会自己报本机的 Houdini 版本、连不上会自动重连，日志写在
+`%TEMP%\HoudiniRenderQueue\worker.log`。主控顶栏的「设备」按钮能看到谁接进来了、
+各自在跑哪一块。
+
+几条行为约定：
+
+- **按帧块派发**：一个任务会被切成若干段（第一刀对半分，之后谁空闲谁拿），
+  每段是一个 hython 进程；断点续渲照旧，帧记录在 master 的库里。
+- **输出路径不带帧变量（`$F`）的任务不会分片**，整包给一台机器——否则多台同时写一个文件必坏。
+- **路径或版本不对会拒绝接单**，主控换一台机器派，不会渲到一半才失败。
+- 关掉主控 = 全部停止；worker 会跑完当前帧再退出，已完成的帧不丢。
+- 没有 `--listen` 时完全是单机模式，行为与以前一模一样。
+
 
 ## 分发到其他电脑
 

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::db::Db;
 use crate::model::*;
 use crate::pyproc;
+use crate::remote::{AssignReq, DoneKind, Hub, HubEvent};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunState {
@@ -28,6 +29,10 @@ pub enum Cmd {
     RestartAll,
     SetConcurrency(usize),
     SetRetries(u32),
+    /// 主界面起好监听后把 Hub 交给引擎（之后才可能出现远端块）
+    AttachHub(Arc<Hub>, Receiver<HubEvent>),
+    /// 设备面板打开时主动要一份快照
+    RefreshWorkers,
     Shutdown,
 }
 
@@ -53,6 +58,53 @@ struct Rt {
     message: String,
     /// 已从执行区移除但还在跑：结束后直接从队列和库里清掉
     detached: bool,
+    /// 已派给远端 worker、还没回报的帧（调度本地时要排掉）
+    remote: BTreeSet<i32>,
+    /// 已经交给本地线程、但还没完成的帧。不排掉的话远端会把同一帧再派一遍，
+    /// 两个进程同时写同一帧的输出。
+    local: BTreeSet<i32>,
+    /// 在跑的远端块 → 该块的帧，块结束时整块回滚或确认
+    blocks: HashMap<String, Vec<i32>>,
+    /// 已经为这个任务做过一次「对半分」。只在第一次生效：否则本地会
+    /// 100→50→25→13→6 一路对半切下去，每段都要重开一次 hython，加载开销爆炸。
+    paced: bool,
+}
+
+impl Rt {
+    fn new(spec: JobSpec, status: JobStatus, attempts: u32, done: BTreeSet<i32>) -> Rt {
+        Rt {
+            spec,
+            status,
+            attempts,
+            done,
+            cancel: Arc::new(AtomicBool::new(false)),
+            running: false,
+            message: String::new(),
+            detached: false,
+            remote: BTreeSet::new(),
+            local: BTreeSet::new(),
+            blocks: HashMap::new(),
+            paced: false,
+        }
+    }
+
+    /// 还没人认领的帧（没完成、没派给远端、也没交给本地线程）。
+    fn free_frames(&self) -> Vec<i32> {
+        self.spec
+            .frames
+            .expand()
+            .into_iter()
+            .filter(|f| {
+                !self.done.contains(f) && !self.remote.contains(f) && !self.local.contains(f)
+            })
+            .collect()
+    }
+
+    /// 全部帧的完成情况：done 覆盖了帧集合就算收工。
+    fn all_done(&self) -> bool {
+        let all = self.spec.frames.expand();
+        !all.is_empty() && all.iter().all(|f| self.done.contains(f))
+    }
 }
 
 pub struct Engine {
@@ -69,6 +121,11 @@ impl Engine {
     pub fn send(&self, c: Cmd) {
         let _ = self.tx.send(c);
     }
+
+    /// 取一个可以跨线程/跨闭包持有的发送端（定时器里发指令用）。
+    pub fn sender(&self) -> Sender<Cmd> {
+        self.tx.clone()
+    }
 }
 
 // ───────────────────────── 主循环 ─────────────────────────
@@ -84,22 +141,16 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
             status
         };
         let done = done_cache.remove(&spec.id).unwrap_or_default();
-        rt.push(Rt {
-            spec,
-            status,
-            attempts,
-            done,
-            cancel: Arc::new(AtomicBool::new(false)),
-            running: false,
-            message: String::new(),
-            detached: false,
-        });
+        rt.push(Rt::new(spec, status, attempts, done));
     }
 
     let (wtx, wrx) = mpsc::channel::<WMsg>();
     let mut state = RunState::Idle;
     let mut concurrency: usize = 1;
     let mut max_retries: u32 = 2;
+    // 没挂 Hub 时整条多机路径不执行，单机行为与以前完全一致
+    let mut hub: Option<Arc<Hub>> = None;
+    let mut hub_rx: Option<Receiver<HubEvent>> = None;
 
     let _ = evt.send(Event::Queue(snapshot(&rt)));
 
@@ -128,24 +179,20 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                             next.push(r);
                         } else {
                             let done = done_cache.remove(&spec.id).unwrap_or_default();
-                            next.push(Rt {
-                                spec,
-                                status: JobStatus::Queued,
-                                attempts: 0,
-                                done,
-                                cancel: Arc::new(AtomicBool::new(false)),
-                                running: false,
-                                message: String::new(),
-                                detached: false,
-                            });
+                            next.push(Rt::new(spec, JobStatus::Queued, 0, done));
                         }
                     }
-                    // 被移出执行区的任务：还在跑的要求它停下（跑完当前帧），
+                    // 被移出执行区的任务：还在跑的（本地线程或远端块）要求它停下，
                     // 结束后由 detached 标记负责清理；其它直接删库
                     for (id, mut r) in old {
-                        if r.running {
+                        if r.running || !r.blocks.is_empty() {
                             r.detached = true;
                             r.cancel.store(true, Ordering::SeqCst);
+                            if let Some(h) = &hub {
+                                for chunk in r.blocks.keys() {
+                                    h.cancel(&id, chunk);
+                                }
+                            }
                             next.push(r);
                         } else {
                             db.delete_job(&id);
@@ -186,6 +233,14 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     for r in rt.iter_mut() {
                         if r.running {
                             r.cancel.store(true, Ordering::SeqCst);
+                        } else if !r.blocks.is_empty() {
+                            // 帧已经派出去了，本地没有线程可控：通知 worker 收工
+                            if let Some(h) = &hub {
+                                for chunk in r.blocks.keys() {
+                                    h.cancel(&r.spec.id, chunk);
+                                }
+                            }
+                            r.status = JobStatus::Canceled;
                         } else if r.status == JobStatus::Queued {
                             r.status = JobStatus::Canceled;
                             db.save_job(&r.spec, 0, r.status, r.attempts);
@@ -197,6 +252,14 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     if let Some(r) = rt.iter_mut().find(|r| r.spec.id == id) {
                         if r.running {
                             r.cancel.store(true, Ordering::SeqCst);
+                        } else if !r.blocks.is_empty() {
+                            if let Some(h) = &hub {
+                                for chunk in r.blocks.keys() {
+                                    h.cancel(&id, chunk);
+                                }
+                            }
+                            r.status = JobStatus::Canceled;
+                            db.save_job(&r.spec, 0, r.status, r.attempts);
                         } else {
                             r.status = JobStatus::Canceled;
                             db.save_job(&r.spec, 0, r.status, r.attempts);
@@ -217,6 +280,7 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                             r.attempts = 0;
                             r.message.clear();
                             r.done.clear();
+                            r.paced = false;
                             db.clear_frames(&r.spec.id);
                             reset += 1;
                         }
@@ -242,6 +306,21 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                 }
                 Cmd::SetConcurrency(n) => concurrency = n.max(1),
                 Cmd::SetRetries(n) => max_retries = n,
+                Cmd::AttachHub(h, hrx) => {
+                    let n = h.online_count();
+                    let _ = evt.send(Event::Workers(h.views()));
+                    hub = Some(h);
+                    hub_rx = Some(hrx);
+                    log(
+                        &evt,
+                        format!("多机执行已就绪（当前在线 {n} 台），可分片任务会按帧块派发"),
+                    );
+                }
+                Cmd::RefreshWorkers => {
+                    if let Some(h) = &hub {
+                        let _ = evt.send(Event::Workers(h.views()));
+                    }
+                }
             }
         }
 
@@ -260,6 +339,8 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                 Ok(WMsg::Done(id, res)) => {
                     if let Some(r) = rt.iter_mut().find(|r| r.spec.id == id) {
                         r.running = false;
+                        // 本地线程退出：它认领过的帧全部释放（没跑完的回到可调度池）
+                        r.local.clear();
                         if r.detached {
                             // 已从执行区移除，结果不再关心：不进重试、不留卡片
                             r.status = JobStatus::Canceled;
@@ -267,12 +348,27 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                         } else {
                             match res {
                                 WResult::Ok => {
-                                    r.status = JobStatus::Success;
-                                    r.message.clear();
-                                    log(
-                                        &evt,
-                                        format!("[{}] 完成（{} 帧）", r.spec.title(), r.done.len()),
-                                    );
+                                    // 本地可能只跑了一部分帧（其余在远端 worker 上），
+                                    // 还有活没完就别提前判成功
+                                    if r.all_done() {
+                                        r.status = JobStatus::Success;
+                                        r.message.clear();
+                                        log(
+                                            &evt,
+                                            format!(
+                                                "[{}] 完成（{} 帧）",
+                                                r.spec.title(),
+                                                r.done.len()
+                                            ),
+                                        );
+                                    } else {
+                                        r.status = if r.blocks.is_empty() {
+                                            JobStatus::Queued
+                                        } else {
+                                            JobStatus::Running
+                                        };
+                                        r.message.clear();
+                                    }
                                 }
                                 WResult::Preflight(m) => {
                                     r.status = JobStatus::Skipped;
@@ -322,17 +418,196 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
             }
         }
 
+        // ── 远端 worker 事件 ──
+        if let Some(hrx) = &hub_rx {
+            while let Ok(ev) = hrx.try_recv() {
+                match ev {
+                    HubEvent::Log(l) => log(&evt, l),
+                    HubEvent::Frame { job, chunk: _, frame } => {
+                        if let Some(r) = rt.iter_mut().find(|r| r.spec.id == job) {
+                            if r.done.insert(frame) {
+                                db.mark_frame(&job, frame);
+                                changed = true;
+                            }
+                        }
+                    }
+                    HubEvent::Done {
+                        job,
+                        chunk,
+                        host,
+                        kind,
+                        detail,
+                        ..
+                    } => {
+                        if let Some(r) = rt.iter_mut().find(|r| r.spec.id == job) {
+                            let frames = r.blocks.remove(&chunk).unwrap_or_default();
+                            for f in &frames {
+                                r.remote.remove(f);
+                            }
+                            let title = r.spec.title();
+                            if r.detached {
+                                r.status = JobStatus::Canceled;
+                                r.message.clear();
+                            } else {
+                                match kind {
+                                    DoneKind::Ok => {
+                                        if r.all_done() {
+                                            r.status = JobStatus::Success;
+                                            r.message.clear();
+                                            log(
+                                                &evt,
+                                                format!(
+                                                    "[{}] 完成（{} 帧，含 {} 上的分片）",
+                                                    title,
+                                                    r.done.len(),
+                                                    host
+                                                ),
+                                            );
+                                            db.save_job(&r.spec, 0, r.status, r.attempts);
+                                        }
+                                    }
+                                    DoneKind::Canceled => {
+                                        r.status = JobStatus::Canceled;
+                                        r.message.clear();
+                                        log(&evt, format!("[{}] 已取消（{host}）", title));
+                                        db.save_job(&r.spec, 0, r.status, r.attempts);
+                                    }
+                                    DoneKind::Preflight | DoneKind::Fail => {
+                                        r.attempts += 1;
+                                        let what = if detail.is_empty() {
+                                            "分片执行失败".to_string()
+                                        } else {
+                                            detail.clone()
+                                        };
+                                        if r.attempts <= max_retries {
+                                            r.status = JobStatus::Queued;
+                                            r.message = format!("第 {} 次重试", r.attempts);
+                                            log(
+                                                &evt,
+                                                format!(
+                                                    "[{}] {} 上失败，准备第 {} 次重试：{}",
+                                                    title, host, r.attempts, what
+                                                ),
+                                            );
+                                        } else {
+                                            r.status = JobStatus::Failed;
+                                            r.message = what.clone();
+                                            log(&evt, format!("[{}] 失败：{}", title, what));
+                                        }
+                                        db.save_job(&r.spec, 0, r.status, r.attempts);
+                                    }
+                                }
+                            }
+                        }
+                        changed = true;
+                    }
+                    HubEvent::Online(_) | HubEvent::Offline { .. } | HubEvent::Changed => {
+                        // 设备面板的数据走单独的快照，这里只驱动一次重排
+                        if let Some(h) = &hub {
+                            let _ = evt.send(Event::Workers(h.views()));
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        }
+
         // ── 调度 ──
         if state == RunState::Running {
+            // 帧都齐了的任务先收工（远端分片可能已经把最后一帧跑完）
+            for r in rt.iter_mut() {
+                if r.detached || r.running || !r.blocks.is_empty() {
+                    continue;
+                }
+                if matches!(r.status, JobStatus::Queued | JobStatus::Running) && r.all_done() {
+                    r.status = JobStatus::Success;
+                    changed = true;
+                }
+            }
+
+            // ① 空闲的远端槽先喂：按帧块切，剩下再给本地
+            if let Some(h) = &hub {
+                loop {
+                    let idle = h.idle_slots();
+                    if idle == 0 {
+                        break;
+                    }
+                    // 本机还剩几个空槽也要算进「这次切几份」：只有一台 worker 时
+                    // 如果只看 idle(=1) 就会整包派出去，本地白白闲着。
+                    // `max(1)` 再给本地预留一份：本机此刻可能正忙着别的任务，
+                    // 但那个任务一结束就该能接上这里剩下的帧。
+                    let free_local = concurrency.saturating_sub(
+                        rt.iter().filter(|r| r.running).count(),
+                    );
+                    let shares = idle + free_local.max(1);
+                    let Some(idx) = rt.iter().position(|r| {
+                        !r.detached
+                            && matches!(r.status, JobStatus::Queued | JobStatus::Running)
+                            && !r.free_frames().is_empty()
+                    }) else {
+                        break;
+                    };
+
+                    let free = rt[idx].free_frames();
+                    let remain = free.len();
+                    // 可分片的按份均摊；不可分片的（输出不带 $F）必须整包给一台。
+                    // 帧太少时也整包：一次 hip 加载几十秒，切两半纯亏（还是 8 帧起步）。
+                    // 只在任务第一次分片时切，之后谁拿都是整包剩余（见 `paced`）。
+                    let size = if is_splittable(&rt[idx].spec)
+                        && !rt[idx].paced
+                        && remain >= 8
+                        && shares > 1
+                    {
+                        remain.div_ceil(shares).max(2)
+                    } else {
+                        remain
+                    };
+                    let take: Vec<i32> = free.into_iter().take(size).collect();
+                    let chunk = block_name(&take);
+                    let req = AssignReq {
+                        job: rt[idx].spec.id.clone(),
+                        chunk: chunk.clone(),
+                        hip: rt[idx].spec.hip.to_string_lossy().to_string(),
+                        node: rt[idx].spec.node_path.clone(),
+                        houdini: rt[idx].spec.houdini.clone(),
+                        output: rt[idx].spec.output.clone(),
+                        frames: take.clone(),
+                    };
+                    // dispatch 失败说明没有匹配的机器（版本不符 / 拒绝过），别死循环
+                    let Some(t) = h.dispatch(&req) else { break };
+
+                    log(
+                        &evt,
+                        format!(
+                            "[{}] 派给 {}：{} 帧（{}）",
+                            rt[idx].spec.title(),
+                            t.host,
+                            take.len(),
+                            chunk
+                        ),
+                    );
+                    rt[idx].remote.extend(take.iter().copied());
+                    rt[idx].blocks.insert(chunk, take);
+                    rt[idx].paced = true;
+                    if rt[idx].status == JobStatus::Queued {
+                        rt[idx].status = JobStatus::Running;
+                    }
+                    changed = true;
+                }
+            }
+
+            // ② 本地槽位：跑还没派出去的帧
             loop {
                 let active = rt.iter().filter(|r| r.running).count();
                 if active >= concurrency {
                     break;
                 }
-                let Some(idx) = rt
-                    .iter()
-                    .position(|r| r.status == JobStatus::Queued && !r.running)
-                else {
+                let Some(idx) = rt.iter().position(|r| {
+                    !r.running
+                        && !r.detached
+                        && matches!(r.status, JobStatus::Queued | JobStatus::Running)
+                        && !r.free_frames().is_empty()
+                }) else {
                     break;
                 };
 
@@ -351,23 +626,21 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                     continue;
                 }
 
-                let frames: Vec<i32> = rt[idx]
-                    .spec
-                    .frames
-                    .expand()
-                    .into_iter()
-                    .filter(|f| !rt[idx].done.contains(f))
-                    .collect();
-
-                if frames.is_empty() {
-                    rt[idx].status = JobStatus::Success;
-                    changed = true;
-                    continue;
+                // 只要还有 worker 在线，本地最多先拿一半：worker 手上那点活很快结束，
+                // 把帧留在池子里它才能接上。没有 worker（纯单机）时仍然整包拿，
+                // 行为与旧版完全一致。
+                let mut frames = rt[idx].free_frames();
+                let remote_online = hub.as_ref().map(|h| h.online_count() > 0).unwrap_or(false);
+                if remote_online && !rt[idx].paced && frames.len() >= 8 {
+                    frames.truncate(frames.len().div_ceil(2));
+                    rt[idx].paced = true;
                 }
 
                 rt[idx].running = true;
                 rt[idx].status = JobStatus::Running;
                 rt[idx].cancel = Arc::new(AtomicBool::new(false));
+                // 这些帧已交给本地线程：远端不能再派同一帧
+                rt[idx].local.extend(frames.iter().copied());
 
                 let spec = rt[idx].spec.clone();
                 let cancel = rt[idx].cancel.clone();
@@ -387,9 +660,13 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                 changed = true;
             }
 
-            let active = rt.iter().filter(|r| r.running).count();
-            let pending = rt.iter().filter(|r| r.status == JobStatus::Queued).count();
-            if active == 0 && pending == 0 {
+            let active_local = rt.iter().filter(|r| r.running).count();
+            let active_remote = rt.iter().filter(|r| !r.blocks.is_empty()).count();
+            let pending = rt
+                .iter()
+                .filter(|r| matches!(r.status, JobStatus::Queued | JobStatus::Running))
+                .count();
+            if active_local == 0 && active_remote == 0 && pending == 0 {
                 state = RunState::Idle;
                 log(&evt, "队列已全部结束".into());
                 changed = true;
@@ -411,6 +688,28 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
 
 fn log(evt: &Sender<Event>, msg: String) {
     let _ = evt.send(Event::Log(format!("{}  {}", pyproc::now_hms(), msg)));
+}
+
+/// 块名：`1052-1070`。只用于标识和日志，不参与去重（去重靠 `remote` 集合）。
+fn block_name(frames: &[i32]) -> String {
+    match (frames.first(), frames.last()) {
+        (Some(a), Some(b)) if a == b => format!("{a}"),
+        (Some(a), Some(b)) => format!("{a}-{b}"),
+        _ => "-".into(),
+    }
+}
+
+/// 这个任务的输出能不能被多台机器同时写。
+///
+/// 只有输出路径里带帧变量（`$F` / `$F4` / `${F}`）时，不同帧才落到不同文件。
+/// 写单文件的任务（mov、单个 usd）一旦并行就是抢同一个文件，必须整包派一台。
+fn is_splittable(spec: &JobSpec) -> bool {
+    let o = &spec.output;
+    if o.is_empty() {
+        return false;
+    }
+    let up = o.to_uppercase();
+    up.contains("$F") || up.contains("${F")
 }
 
 fn snapshot(rt: &[Rt]) -> Vec<JobView> {

@@ -443,3 +443,64 @@ P0 通过后再动代码，否则会花两天写完发现工程根本没法在�
 > 不是造农场，是给现有执行槽加一个"远端"实现：**粒度用帧块**（省钱在 hython 加载），
 > **校验放派发阶段**（路径和版本问题在起进程前就暴露），**只让 master 碰数据库**（避开 SMB + SQLite），
 > **协议包一层 NDJSON**（复用现有标记行解析）。真正的成本在共享存储和工程规范，不在通讯。
+
+---
+
+## 12. 实现状态（2026.2.0 起）
+
+### 已实现（P1）
+
+| 项 | 位置 |
+|---|---|
+| NDJSON 协议（hello/welcome/claim/assign/accept/reject/line/result/beat/cancel） | `src/remote.rs` |
+| master 侧 Hub：TcpListener、worker 池、乐观占用、心跳超时巡检 | `src/remote.rs` |
+| worker 角色：拨号重连、reject 校验、起本机 hython、只回传标记行 | `src/remote.rs` |
+| 帧块派发 + 本地/远端并行 + 断线归还 | `src/queue.rs` |
+| 设备面板（顶栏「设备 N」+ 右上浮层） | `ui/app.slint` + `src/main.rs` |
+| 单测 7 条（协议往返、版本匹配、块名、DoneKind） | `src/remote.rs` 的 `tests` |
+
+用法：master `--listen [端口]`，worker `--worker --connect <ip:port> [--slots n]`。
+
+### 和设计不同的地方（改文档前先看这里）
+
+1. **没有加 `JobSpec.splittable` 字段**，也没动数据库。可分片性由 `queue.rs::is_splittable()`
+   从 `spec.output` 现算（是否含 `$F`/`${F`）。少一次 schema 迁移，少一处状态不一致。
+2. **没有 `jobs.host` 列**。P1 里"哪个任务在哪台机器跑的"只进日志（`[任务] 派给 WS-02：50 帧`），
+   不落库。要做历史排查再加。
+3. **没有做"对半分"的自适应片大小**（5.2 那套 `load_ms`/`frame_ms` 观测）。P1 固定：
+   首次对半分、帧数 <8 不切、之后整包。实测 100 帧任务 2 机从 9 秒降到 5 秒。
+4. **`shares` 把本地空闲槽算进去了**（`idle + free_local.max(1)`）。只按远端 idle 算的话，
+   只有一台 worker 时它会整包吃光，本地闲着。
+5. **`reject` 后同一块不再派给同一台机器**（`Worker.rejected` 集合），但**失败（fail）不记**——
+   真失败该按 retries 重试，不是换机器就能好。
+
+### 踩到的两个真问题（都修了）
+
+- **preflight 探针文件名写死** `.hrq_write_test`：多台机器同时预检同一输出目录会互相抢文件，
+  后到的误报「目录不可写」。改成 `.hrq_write_test_<uuid>`。
+- **`same_minor` 会误配脏版本号**：`20.5.684-fake` 按同主次版本命中了真实的 `20.5.684`，
+  拿真 Houdini 去开测试用的假 hip。现在只认纯数字版本串。
+
+### 还没做（P2 及以后）
+
+- 设备面板调槽位、手动摘除节点
+- 失败换机重试（现在失败走 retries，可能还落在同一台）
+- 自适应片大小（按观测到的 `load_ms` / `frame_ms`）
+- 队列卡片显示执行机器标签（`JobView` 还没加 `host` 字段）
+- 缓存/解算节点的"顺序执行"勾选（跨帧依赖只能靠人判断）
+
+### 怎么自己验一遍（不用第二台机器）
+
+```bash
+# 主控：开监听 + 自动跑 devtest 的假工程
+APPDATA=<隔离目录> HRQ_HYTHON=<devtest\python 包装> houdini-render-queue.exe \
+  --listen 7879 --add devtest/sh010/sh010_efx.hip --run
+
+# 同一台机器再起一个当 worker（127.0.0.1 连自己）
+APPDATA=<隔离目录> HRQ_HYTHON=<devtest\python 包装> houdini-render-queue.exe \
+  --worker --connect 127.0.0.1:7879
+```
+
+日志里出现 `[abc_cache] 派给 A：50 帧（1-50）` + 本地同时 `[abc_cache] 开始：50 帧`
+就说明分片与并行都对了。库里 5 个任务全 `success`、帧数合计 227 即无漏跑无重复。
+

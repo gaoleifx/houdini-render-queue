@@ -12,6 +12,7 @@ mod houdini;
 mod model;
 mod pyproc;
 mod queue;
+mod remote;
 mod snap;
 mod windrop;
 
@@ -376,8 +377,18 @@ fn rebuild_nodes(ui: &AppWindow, app: &mut App) {
     ui.set_node_empty_hint(hint.into());
 }
 
-fn qtask_of(v: &JobView) -> QTask {
-    QTask {
+/// 设备面板里显示的任务名：job id 是「工程 key:节点路径」，只留最后的节点名。
+fn short_job(id: &str) -> String {
+    id.rsplit(':')
+        .next()
+        .unwrap_or(id)
+        .rsplit('/')
+        .next()
+        .unwrap_or(id)
+        .to_string()
+}
+
+fn qtask_of(v: &JobView) -> QTask {    QTask {
         nid: v.id.clone().into(),
         title: v.title.clone().into(),
         shot: v.shot.clone().into(),
@@ -1197,7 +1208,64 @@ fn apply_theme(ui: &AppWindow, dark: bool) {
     windrop::set_dark_titlebar(windrop::hwnd_of(&ui.window()), dark);
 }
 
+// ───────────────────────── 多机执行的启动参数 ─────────────────────────
+
+/// `--flag value` 的取值（取值不存在或是另一个开关时返回 None）。
+fn arg_value(flag: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == flag)?;
+    let v = args.get(i + 1)?;
+    if v.starts_with("--") {
+        None
+    } else {
+        Some(v.clone())
+    }
+}
+
+/// 判定是不是 worker 角色；是就返回主控地址。
+///
+/// 三种写法都认：`--worker 1.2.3.4:7878`、`--worker --connect 1.2.3.4:7878`、
+/// 单独 `--connect 1.2.3.4:7878`。都没有地址时回落到本机默认端口。
+fn worker_target() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let is_worker = args.iter().any(|a| a == "--worker") || args.iter().any(|a| a == "--connect");
+    if !is_worker {
+        return None;
+    }
+    // --worker 后面紧跟的裸地址
+    if let Some(i) = args.iter().position(|a| a == "--worker") {
+        if let Some(next) = args.get(i + 1) {
+            if !next.starts_with("--") {
+                return Some(next.clone());
+            }
+        }
+    }
+    Some(
+        arg_value("--connect").unwrap_or_else(|| format!("127.0.0.1:{}", remote::DEFAULT_PORT)),
+    )
+}
+
+/// 主控监听端口。没给 `--listen` 就不开多机，单机行为与以前一模一样。
+fn listen_port() -> Option<u16> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--listen")?;
+    Some(
+        args.get(i + 1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(remote::DEFAULT_PORT),
+    )
+}
+
 fn main() -> Result<(), slint::PlatformError> {
+    // worker 模式：只当执行端，不初始化界面、不打开数据库、不扫描 hip。
+    // 判定放在最前面，连 Slint 都不碰（详见 docs/multi-machine.md）
+    if let Some(addr) = worker_target() {
+        let slots = arg_value("--slots")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        remote::run_worker_role(&addr, slots);
+    }
+
     // 调试用：只打印 hip 版本识别结果并退出，不起界面
     if let Some(pos) = std::env::args().position(|a| a == "--probe-version") {
         let installs = houdini::detect_installs();
@@ -1305,6 +1373,29 @@ fn main() -> Result<(), slint::PlatformError> {
             &mut a,
             format!("{}  就绪：探测到 {} 个 Houdini 安装", pyproc::now_hms(), n),
         );
+    }
+
+    // 多机执行：只有显式给 --listen 才开监听，不带这个参数时一切照旧（纯单机）
+    ui.set_device_hint("未开启多机：用 --listen [端口] 启动，其他机器即可接入".into());
+    if let Some(port) = listen_port() {
+        match remote::Hub::start(port) {
+            Ok((hub, hrx)) => {
+                app.borrow().engine.send(Cmd::AttachHub(hub, hrx));
+                ui.set_device_hint(
+                    format!(
+                        "监听 0.0.0.0:{port} · 其他机器运行：houdini-render-queue.exe --worker --connect <本机IP>:{port}"
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => {
+                let mut a = app.borrow_mut();
+                push_log(
+                    &mut a,
+                    format!("{}  多机监听失败（端口 {port}）：{e}", pyproc::now_hms()),
+                );
+            }
+        }
     }
 
     {
@@ -1805,6 +1896,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let app = app.clone();
+        ui.on_toggle_devices(move || {
+            // 面板要显示最新状态：让引擎推一份快照过来
+            app.borrow().engine.send(Cmd::RefreshWorkers);
+        });
+    }
+
+    {
+        let app = app.clone();
         let ui_weak = ui.as_weak();
         let picker = picker.clone();
         ui.on_font_changed(move || {
@@ -1931,6 +2030,48 @@ fn main() -> Result<(), slint::PlatformError> {
                 while let Ok(ev) = rx.try_recv() {
                     match ev {
                         Event::Log(l) => push_log(&mut a, l),
+                        Event::Workers(views) => {
+                            let online = views.iter().filter(|v| v.online).count();
+                            // 顶栏显示「设备 N」：N 含本机自己
+                            ui.set_device_label(format!("设备 {}", online + 1).into());
+                            let me = std::env::var("COMPUTERNAME")
+                                .unwrap_or_else(|_| "本机".into());
+                            let local_ver = a
+                                .installs
+                                .first()
+                                .map(|i| i.version.clone())
+                                .unwrap_or_default();
+                            let mut list: Vec<Device> = Vec::with_capacity(views.len() + 1);
+                            list.push(Device {
+                                host: format!("{me}（本机）").into(),
+                                state: "本地".into(),
+                                slots: format!("{} 槽", a.concurrency).into(),
+                                houdini: local_ver.into(),
+                                job: "".into(),
+                                tone: 5,
+                            });
+                            for v in views.iter() {
+                                list.push(Device {
+                                    host: v.host.clone().into(),
+                                    state: if v.online {
+                                        format!("{}/{}", v.busy, v.slots).into()
+                                    } else {
+                                        "离线".into()
+                                    },
+                                    slots: format!("{} 槽", v.slots).into(),
+                                    houdini: v.houdini.clone().into(),
+                                    job: if v.online && !v.chunk.is_empty() {
+                                        format!("{}  [{}]", short_job(&v.job), v.chunk).into()
+                                    } else if v.online {
+                                        "空闲".into()
+                                    } else {
+                                        "".into()
+                                    },
+                                    tone: if v.online { 2 } else { 0 },
+                                });
+                            }
+                            ui.set_devices(ModelRc::new(VecModel::from(list)));
+                        }
                         Event::Queue(views) => {
                             let sig = signature(&views);
                             a.queued = views
@@ -2012,6 +2153,18 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             },
         );
+    }
+
+    // 调试用：--devices-open 启动即展开设备面板（配合 --snapshot 做界面回归）
+    if std::env::args().any(|a| a == "--devices-open") {
+        let ui_weak = ui.as_weak();
+        let engine = app.borrow().engine.sender();
+        slint::Timer::single_shot(Duration::from_millis(800), move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_devices_open(true);
+                let _ = engine.send(Cmd::RefreshWorkers);
+            }
+        });
     }
 
     // 调试用：--click-node <行号> 直接触发一次勾选回调，绕开鼠标命中测试

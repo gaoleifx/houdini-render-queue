@@ -7,6 +7,9 @@ export struct Shot { name: string, sub: string, meta: string, tone: int }
 export struct OutNode { checked: bool, path: string, ntype: string, category: string, output: string, range: string, status: string, tone: int }
 export struct QTask { nid: string, title: string, shot: string, category: string, range: string, status: string, progress: int, frames: string, tone: int }
 
+// 设备面板一行：一台参与渲染的机器（或本机自己的执行槽）
+export struct Device { host: string, state: string, slots: string, houdini: string, job: string, tone: int }
+
 // ─────────────────────────────────────────────────────────────
 // 主题 token：暗房仪器风。深石墨底 + 暖灰字 + 单一琥珀强调。
 // 不用纯黑/纯白，暗色下也不上高饱和霓虹。
@@ -569,6 +572,17 @@ export component AppWindow inherits Window {
     /// 有文件正悬停在窗口上（由 Rust 侧 OLE DragEnter/DragLeave 驱动）
     in-out property <bool> drag-hover: false;
 
+    // ── 多机执行 ──
+    /// 设备面板开关
+    in-out property <bool> devices-open: false;
+    /// 设备列表（本机槽位 + 已接入的 worker）
+    in-out property <[Device]> devices;
+    /// 顶栏按钮上的文字，形如「设备 2」
+    in-out property <string> device-label: "设备";
+    /// 面板底部那行提示（监听地址 / 未开启时的说明）
+    in-out property <string> device-hint: "";
+    callback toggle-devices();
+
     // 日志跟随：有新日志时把日志视图贴到最底部（超出范围由 Flickable 自行夹紧）
     changed log-text => {
         if (follow-log) {
@@ -728,6 +742,9 @@ export component AppWindow inherits Window {
                         TBtn { label: "暂停"; w: 64px; clicked => { root.pause-all(); } }
                         TBtn { label: "取消"; kind: 3; w: 64px; clicked => { root.cancel-all(); } }
                         VRule { }
+                        // 多机：点开看有哪些机器在跑、各自槽位与当前任务
+                        TBtn { label: root.device-label; w: 64px; clicked => { root.toggle-devices(); } }
+                        Rectangle { width: 4px; height: 1px; }
                         // 外观
                         // 与「开始 / 暂停 / 取消」同宽：46px 时两字几乎顶到边框，留白比隔壁按钮
                         // 小一大截，看着像字号不一样。统一 64px 后整排按钮的呼吸感才一致
@@ -1242,6 +1259,96 @@ export component AppWindow inherits Window {
                         font-size: Fonts.size(10.5px);
                         color: Theme.text-3;
                         vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // ── 设备面板 ──
+        // 从右上角展开的浮层。遮罩铺满整窗，点空白处关闭；卡片自己吃掉点击，
+        // 否则点在面板空白处会被下层遮罩当成「点外面」直接关掉。
+        if root.devices-open : Rectangle {
+            background: #00000055;
+            TouchArea {
+                clicked => { root.devices-open = false; }
+            }
+            dev-card := Rectangle {
+                x: parent.width - self.width - 14px;
+                y: 58px;
+                width: 380px;
+                height: Math.max(110px, dev-body.preferred-height + 4px);
+                border-radius: 10px;
+                background: Theme.panel;
+                border-width: 1px;
+                border-color: Theme.border-2;
+                TouchArea { }
+                dev-body := VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: "执行设备";
+                            font-size: Fonts.size(12px);
+                            font-weight: 600;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        TBtn { label: "关闭"; w: 46px; h: 21px; clicked => { root.devices-open = false; } }
+                    }
+                    Rule { }
+
+                    for dev in root.devices : VerticalLayout {
+                        spacing: 2px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Rectangle {
+                                width: 6px;
+                                height: 6px;
+                                border-radius: 3px;
+                                background: Tone.fg(dev.tone);
+                                y: (parent.height - 6px) / 2;
+                            }
+                            Text {
+                                text: dev.host;
+                                font-size: Fonts.size(11.5px);
+                                font-weight: 600;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Tag { text: dev.slots; }
+                            Tag { text: dev.state; tint: Tone.fg(dev.tone); }
+                        }
+                        Text {
+                            text: dev.houdini;
+                            font-size: Fonts.size(10px);
+                            color: Theme.text-3;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: dev.job;
+                            font-size: Fonts.size(10px);
+                            color: Theme.text-2;
+                            overflow: elide;
+                            visible: dev.job != "";
+                        }
+                    }
+
+                    if root.devices.length == 0 : Text {
+                        text: "还没有其他机器接入";
+                        font-size: Fonts.size(11px);
+                        color: Theme.text-3;
+                    }
+
+                    Rule { }
+                    Text {
+                        text: root.device-hint;
+                        font-size: Fonts.size(10px);
+                        color: Theme.text-3;
+                        wrap: word-wrap;
                     }
                 }
             }

@@ -22,6 +22,7 @@ plan.json: {"frames": [1,2,3,10,11]}
 import sys
 import os
 import json
+import uuid
 import argparse
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -85,7 +86,11 @@ def preflight(node, fstart):
     except Exception as e:
         return False, "无法创建输出目录 %s (%s)" % (outdir, e)
 
-    probe = os.path.join(outdir, ".hrq_write_test")
+    # 探针文件名必须唯一：多台机器（或同一台机器的多个任务）同时预检同一个
+    # 输出目录时，固定名字会互相抢文件，后到的那台会误报「目录不可写」。
+    probe = os.path.join(
+        outdir, ".hrq_write_test_%s" % uuid.uuid4().hex[:12]
+    )
     try:
         with open(probe, "w") as f:
             f.write("ok")

@@ -250,6 +250,8 @@ pub struct AnalyzePayload {
 pub enum Event {
     Queue(Vec<JobView>),
     Log(String),
+    /// 设备面板：在线 worker 的快照
+    Workers(Vec<crate::remote::WorkerView>),
     Analyzed {
         key: String,
         result: Result<AnalyzePayload, String>,
