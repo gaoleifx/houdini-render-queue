@@ -308,6 +308,12 @@ cargo build --release    # 产物 target/release/houdini-render-queue.exe
 | 换图标 | `python tools/make_icon.py --variant b` → 重编（`build.rs` 用 rc.exe）→ `python tools/peek_icon.py` 校验 |
 | 加命令行调试开关 | `main.rs` 的 `main()` 参数解析（已有开关都在这儿） |
 
+**版本号（`Cargo.toml` + 关于框）**：格式 `YYYY.M.N`，当前 `2026.3.0`。
+
+- 小改动、或功能只做了一部分 → 只加第三位：`2026.3.0` → `2026.3.1` → `2026.3.2`。
+- 只有**重大功能完整落地**才动第二位，第三位归零：`2026.3.x` → `2026.4.0`。
+- 第二位代表「一个完整的功能阶段」，不要每次改完都往上加。
+
 ---
 
 ## 10. 词汇表
