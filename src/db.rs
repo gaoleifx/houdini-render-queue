@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use rusqlite::{params, Connection};
 
+use crate::frames::FrameSet;
 use crate::model::{Category, JobSpec, JobStatus, NodeInfo, Project};
 
 pub struct Db {
@@ -57,7 +58,10 @@ impl Db {
                 fstart     INTEGER NOT NULL,
                 fend       INTEGER NOT NULL,
                 status     TEXT NOT NULL,
-                attempts   INTEGER NOT NULL
+                attempts   INTEGER NOT NULL,
+                -- 帧集合的规范写法（1052,1055-1056,1065-1070）；老库补列后为空串，
+                -- 读的时候为空就退回 fstart..fend 当连续区间
+                frames     TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS frames (
                 job_id TEXT NOT NULL,
@@ -71,23 +75,31 @@ impl Db {
             "#,
         )?;
         // 老库补列：pinned（用户手动指定版本）是后加的字段
-        let has_pinned = self
-            .conn
-            .prepare("PRAGMA table_info(projects)")
+        if !self.has_column("projects", "pinned") {
+            let _ = self
+                .conn
+                .execute_batch("ALTER TABLE projects ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
+        }
+        // 老库补列：jobs.frames（不连续帧集合）也是后加的
+        if !self.has_column("jobs", "frames") {
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE jobs ADD COLUMN frames TEXT NOT NULL DEFAULT ''",
+            );
+        }
+        Ok(())
+    }
+
+    fn has_column(&self, table: &str, col: &str) -> bool {
+        self.conn
+            .prepare(&format!("PRAGMA table_info({table})"))
             .and_then(|mut s| {
                 let names: Vec<String> = s
                     .query_map([], |r| r.get::<_, String>(1))?
                     .flatten()
                     .collect();
-                Ok(names.iter().any(|n| n == "pinned"))
+                Ok(names.iter().any(|n| n == col))
             })
-            .unwrap_or(true);
-        if !has_pinned {
-            let _ = self
-                .conn
-                .execute_batch("ALTER TABLE projects ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
-        }
-        Ok(())
+            .unwrap_or(true)
     }
 
     // ── 工程 ──
@@ -177,11 +189,11 @@ impl Db {
     pub fn save_job(&self, spec: &JobSpec, ord: i64, status: JobStatus, attempts: u32) {
         let _ = self.conn.execute(
             "INSERT INTO jobs (id, ord, project_key, hip, hython, houdini, shot, node_path,
-                               node_type, category, output, fstart, fend, status, attempts)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                               node_type, category, output, fstart, fend, status, attempts, frames)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(id) DO UPDATE SET
                 ord=excluded.ord, status=excluded.status, attempts=excluded.attempts,
-                fstart=excluded.fstart, fend=excluded.fend",
+                fstart=excluded.fstart, fend=excluded.fend, frames=excluded.frames",
             params![
                 spec.id,
                 ord,
@@ -194,10 +206,11 @@ impl Db {
                 spec.node_type,
                 spec.category.as_str(),
                 spec.output,
-                spec.fstart,
-                spec.fend,
+                spec.frames.start(),
+                spec.frames.end(),
                 status.as_str(),
-                attempts
+                attempts,
+                spec.frames.label()
             ],
         );
     }
@@ -213,11 +226,11 @@ impl Db {
         for (spec, ord, status, attempts) in jobs {
             let _ = tx.execute(
                 "INSERT INTO jobs (id, ord, project_key, hip, hython, houdini, shot, node_path,
-                                   node_type, category, output, fstart, fend, status, attempts)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                                   node_type, category, output, fstart, fend, status, attempts, frames)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
                  ON CONFLICT(id) DO UPDATE SET
                     ord=excluded.ord, status=excluded.status, attempts=excluded.attempts,
-                    fstart=excluded.fstart, fend=excluded.fend",
+                    fstart=excluded.fstart, fend=excluded.fend, frames=excluded.frames",
                 params![
                     spec.id,
                     ord,
@@ -230,10 +243,11 @@ impl Db {
                     spec.node_type,
                     spec.category.as_str(),
                     spec.output,
-                    spec.fstart,
-                    spec.fend,
+                    spec.frames.start(),
+                    spec.frames.end(),
                     status.as_str(),
-                    attempts
+                    attempts,
+                    spec.frames.label()
                 ],
             );
         }
@@ -279,7 +293,7 @@ impl Db {
         let mut out = Vec::new();
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT id,project_key,hip,hython,houdini,shot,node_path,node_type,category,
-                    output,fstart,fend,status,attempts
+                    output,fstart,fend,status,attempts,frames
              FROM jobs ORDER BY ord ASC",
         ) else {
             return out;
@@ -300,6 +314,7 @@ impl Db {
                 r.get::<_, i32>(11)?,
                 r.get::<_, String>(12)?,
                 r.get::<_, i64>(13)?,
+                r.get::<_, String>(14)?,
             ))
         }) {
             for row in rows.flatten() {
@@ -318,7 +333,10 @@ impl Db {
                     fend,
                     status,
                     attempts,
+                    frames,
                 ) = row;
+                // frames 列是后加的：老库里是空串，退回 fstart..fend 当连续区间
+                let frames = FrameSet::parse(&frames).unwrap_or_else(|_| FrameSet::span(fstart, fend));
                 out.push((
                     JobSpec {
                         id,
@@ -331,8 +349,7 @@ impl Db {
                         node_type,
                         category: Category::parse(&category),
                         output,
-                        fstart,
-                        fend,
+                        frames,
                     },
                     JobStatus::parse(&status),
                     attempts as u32,

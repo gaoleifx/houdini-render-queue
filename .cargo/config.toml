@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-msvc]
+# 静态链接 C 运行库（/MT）：产物不依赖目标机器上的 VCRUNTIME140.dll，
+# 也就不需要用户先装 Visual C++ 2015-2022 Redistributable。
+# 这是「拷到别人电脑上打不开」的头号原因，别去掉。
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -575,6 +575,29 @@ mod imp {
         DROP_COUNT.load(Ordering::SeqCst)
     }
 
+    /// 主显示器工作区（物理像素，已扣掉任务栏）。恢复窗口尺寸时用来夹一下，
+    /// 免得上次在大显示器上关掉、这次换小屏打开直接超出屏幕。
+    pub fn work_area() -> (i32, i32) {
+        const SPI_GETWORKAREA: u32 = 0x0030;
+        #[repr(C)]
+        struct Rect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SystemParametersInfoW(action: u32, param: u32, pv: *mut Rect, win_ini: u32) -> i32;
+        }
+        let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+        let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r, 0) };
+        if ok == 0 || r.right <= r.left || r.bottom <= r.top {
+            return (1920, 1080);
+        }
+        (r.right - r.left, r.bottom - r.top)
+    }
+
     #[link(name = "dwmapi")]
     unsafe extern "system" {
         fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const i32, size: u32) -> i32;
@@ -707,7 +730,7 @@ mod imp {
 
 pub use imp::{
     Report, drop_count, install, is_hovering, post_drop, set_big_icon, set_dark_titlebar,
-    take_double_click, take_dropped,
+    take_double_click, take_dropped, work_area,
 };
 
 /// 从 Slint 窗口取出原生窗口句柄（Windows 的 HWND）。

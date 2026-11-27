@@ -353,7 +353,8 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
 
                 let frames: Vec<i32> = rt[idx]
                     .spec
-                    .frames()
+                    .frames
+                    .expand()
                     .into_iter()
                     .filter(|f| !rt[idx].done.contains(f))
                     .collect();
@@ -375,11 +376,10 @@ fn run(rx: Receiver<Cmd>, evt: Sender<Event>, db: Db) {
                 log(
                     &evt,
                     format!(
-                        "[{}] 开始：{} 帧（{}–{}）· {}",
+                        "[{}] 开始：{} 帧（{}）· {}",
                         spec.title(),
                         frames.len(),
-                        spec.fstart,
-                        spec.fend,
+                        spec.frames.display(44),
                         spec.houdini
                     ),
                 );
@@ -416,8 +416,9 @@ fn log(evt: &Sender<Event>, msg: String) {
 fn snapshot(rt: &[Rt]) -> Vec<JobView> {
     rt.iter()
         .map(|r| {
-            let total = (r.spec.fend - r.spec.fstart + 1).max(1);
-            let done = r.done.range(r.spec.fstart..=r.spec.fend).count() as i32;
+            // 帧数按集合算：不连续帧的 1052,1055,1056 是 3 帧，不是 1056-1052+1
+            let total = r.spec.frames.len().max(1);
+            let done = r.spec.frames.count_done(&r.done) as i32;
             let progress = if total > 0 {
                 ((done as f32 / total as f32) * 100.0) as i32
             } else {
@@ -425,7 +426,8 @@ fn snapshot(rt: &[Rt]) -> Vec<JobView> {
             };
             let frames = if !r.message.is_empty() {
                 r.message.clone()
-            } else if done > 0 || r.status == JobStatus::Running {
+            } else if done > 0 || !r.status.is_finished() {
+                // 排队时也把总帧数报出来：不连续帧光看范围数不出帧数
                 format!("{} / {} 帧", done, total)
             } else {
                 String::new()
@@ -437,7 +439,7 @@ fn snapshot(rt: &[Rt]) -> Vec<JobView> {
                 title: r.spec.title(),
                 shot: r.spec.shot.clone(),
                 category: r.spec.category.label().into(),
-                range: format!("{}–{}", r.spec.fstart, r.spec.fend),
+                range: r.spec.frames.display(30),
                 status: r.status.label().into(),
                 progress,
                 frames,

@@ -6,6 +6,8 @@ slint::include_modules!();
 
 mod analyze;
 mod db;
+mod fonts;
+mod frames;
 mod houdini;
 mod model;
 mod pyproc;
@@ -25,6 +27,7 @@ use slint::{Model, ModelRc, VecModel};
 use walkdir::WalkDir;
 
 use db::Db;
+use frames::{FrameErr, FrameSet};
 use model::*;
 use queue::{Cmd, Engine};
 
@@ -43,8 +46,13 @@ struct App {
     views: Vec<JobView>,
     /// 已入队节点：job_id -> 状态
     queued: HashMap<String, JobStatus>,
-    /// 节点帧范围覆盖：job_id -> (起, 止)
-    ranges: HashMap<String, (i32, i32)>,
+    /// 节点帧范围覆盖：job_id -> 帧集合（可以是 1052,1055,1065-1070 这种不连续帧）
+    ranges: HashMap<String, FrameSet>,
+    /// 正在编辑但还没提交的帧范围草稿 (行下标, 文本)：
+    /// 打字过程中只记在这里，不写库、不写 ranges，回车/失焦才提交
+    draft: Option<(usize, String)>,
+    /// 上一次报过的帧范围错误：同样的错误连着来（回车后又失焦）只记一条
+    last_range_err: Option<(String, std::time::Instant)>,
     search: String,
     filter: i32,
     only_unadded: bool,
@@ -216,10 +224,10 @@ fn node_row(app: &App, needle: &str, pi: usize, ni: usize) -> Option<OutNode> {
     if app.only_unadded && status.is_some() {
         return None;
     }
-    let (a, b) = app
+    let fr = app
         .ranges
         .get(&id)
-        .copied()
+        .cloned()
         .unwrap_or_else(|| default_range(project, n));
     Some(OutNode {
         checked: status.is_some(),
@@ -232,7 +240,7 @@ fn node_row(app: &App, needle: &str, pi: usize, ni: usize) -> Option<OutNode> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "—".into())
             .into(),
-        range: format!("{a}-{b}").into(),
+        range: fr.label().into(),
         status: status.map(|s| s.label()).unwrap_or("未加入").into(),
         tone: status.map(|s| s.tone()).unwrap_or(0),
     })
@@ -289,6 +297,9 @@ fn refresh_rows(app: &App) {
 }
 
 fn rebuild_nodes(ui: &AppWindow, app: &mut App) {
+    // 整表重建会换掉所有行实例：草稿里的行下标立刻失效，直接丢弃（别把脏值提交到别的行）
+    app.draft = None;
+    ui.set_range_invalid(-1);
     let cur = (ui.get_current_shot().max(0) as usize).min(app.projects.len().saturating_sub(1));
     app.visible.clear();
 
@@ -436,20 +447,20 @@ fn signature(views: &[JobView]) -> String {
 
 // ───────────────────────── 队列增删 ─────────────────────────
 
-fn default_range(p: &Project, n: &NodeInfo) -> (i32, i32) {
+fn default_range(p: &Project, n: &NodeInfo) -> FrameSet {
     let a = n.fstart.unwrap_or(p.global.0);
     let b = n.fend.unwrap_or(p.global.1);
-    if b < a { (a, a) } else { (a, b) }
+    FrameSet::span(a, b)
 }
 
 fn make_spec(app: &App, pi: usize, ni: usize) -> Option<JobSpec> {
     let p = app.projects.get(pi)?;
     let n = p.nodes.get(ni)?;
     let id = job_id(&p.key, &n.path);
-    let (a, b) = app
+    let fr = app
         .ranges
         .get(&id)
-        .copied()
+        .cloned()
         .unwrap_or_else(|| default_range(p, n));
     Some(JobSpec {
         id,
@@ -462,8 +473,7 @@ fn make_spec(app: &App, pi: usize, ni: usize) -> Option<JobSpec> {
         node_type: n.ntype.clone(),
         category: n.cat(),
         output: n.output.clone().unwrap_or_default(),
-        fstart: a,
-        fend: b,
+        frames: fr,
     })
 }
 
@@ -518,6 +528,8 @@ fn sync_jobs(app: &App) {
 // ───────────────────────── 交互动作 ─────────────────────────
 
 fn toggle_node(ui: &AppWindow, app: &mut App, idx: usize) {
+    // 入队要读帧范围：先把还没提交的编辑落地，别让新任务带着旧范围进去
+    flush_draft(ui, app);
     let Some(&(pi, ni)) = app.visible.get(idx) else {
         return;
     };
@@ -540,6 +552,7 @@ fn toggle_node(ui: &AppWindow, app: &mut App, idx: usize) {
 }
 
 fn select_all(ui: &AppWindow, app: &mut App, on: bool) {
+    flush_draft(ui, app);
     let list = app.visible.clone();
     for (pi, ni) in list {
         let Some(spec) = make_spec(app, pi, ni) else {
@@ -606,8 +619,64 @@ fn remove_project(ui: &AppWindow, app: &mut App, idx: usize) {
     rebuild_queue(ui, app);
 }
 
-fn edit_range(ui: &AppWindow, app: &mut App, idx: usize, text: String) {
+// ───────────────────────── 帧范围编辑 ─────────────────────────
+// 「输入过程」和「生效」必须分开。TextInput 每敲一个字符都会触发 edited，
+// 而 1001-1050 改成 1001-1060 的路上必然经过 「1001-」/「1001-106」 这种中间态，
+// 它们在语义上一定非法（结束帧还没打完 / 比起始帧小）。所以：
+//   edited    → 只记草稿、只决定描边颜色；不写库、不重建、不报错、不覆盖输入
+//   committed → 回车或失焦才解析提交；成功写库，失败保留文本 + 红框 + 一条日志
+// 这样用户打字时不会被自己的中间态打断，也不会因为一次输入往队列里灌进 1-1、10-10 这类脏范围。
+
+/// 只判断「这串字符还像不像个帧集合」，用于打字时的红框。
+/// 空串、只打了半截（`1001-`）、末尾多一个逗号都不算错 —— 那是还没输完。
+/// `1001-106` 也不算错，倒序要到提交时才有结论。
+fn range_draft_bad(s: &str) -> bool {
+    for tok in s.split([',', '，', ';', '；', '、']) {
+        let t: String = tok
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| match c {
+                '–' | '—' | '~' | '～' | '至' | '到' => '-',
+                c => c,
+            })
+            .collect();
+        if t.is_empty() {
+            continue;
+        }
+        let mut dashes = 0;
+        for c in t.chars() {
+            match c {
+                '0'..='9' => {}
+                '-' => {
+                    dashes += 1;
+                    if dashes > 1 {
+                        return true;
+                    }
+                }
+                // 字母、小数点之类根本不像帧范围，立刻标红
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
+fn parse_frames(s: &str) -> Result<FrameSet, FrameErr> {
+    FrameSet::parse(s)
+}
+
+/// 打字中：只存草稿 + 决定红框，模型和库都不动
+fn edit_range_draft(ui: &AppWindow, app: &mut App, idx: usize, text: String) {
+    let bad = range_draft_bad(&text);
+    app.draft = Some((idx, text));
+    ui.set_range_invalid(if bad { idx as i32 } else { -1 });
+}
+
+/// 回车 / 失焦 / 点按钮前的强制提交：只有这里会真正改队列和库
+fn commit_range(ui: &AppWindow, app: &mut App, idx: usize, text: String) {
+    app.draft = None;
     let Some(&(pi, ni)) = app.visible.get(idx) else {
+        ui.set_range_invalid(-1);
         return;
     };
     let (pkey, npath, defr) = {
@@ -616,23 +685,56 @@ fn edit_range(ui: &AppWindow, app: &mut App, idx: usize, text: String) {
         (p.key.clone(), n.path.clone(), default_range(p, n))
     };
     let id = job_id(&pkey, &npath);
-    let Some((a, b)) = parse_range(&text) else {
-        push_log(app, format!("{}  帧范围格式不对：「{}」，用 1-120 这种写法", pyproc::now_hms(), text));
-        rebuild_nodes(ui, app);
-        return;
+
+    let fr = match parse_frames(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            // 关键：不写库、不重建、不改写输入框。留着用户打的字 + 红框，他可以接着改
+            ui.set_range_invalid(idx as i32);
+            let shown = if text.trim().is_empty() {
+                "（空）".to_string()
+            } else {
+                text.clone()
+            };
+            let msg = match e {
+                FrameErr::Format => format!(
+                    "帧集合格式不对：「{shown}」，可以写 1001-1060，也可以写 1052,1055,1065-1070"
+                ),
+                FrameErr::Reversed(a, b) => format!(
+                    "帧集合不合法：「{shown}」，{a}-{b} 的结束帧小于起始帧"
+                ),
+                FrameErr::TooMany => format!(
+                    "帧集合太大：「{shown}」，单个任务最多 {} 帧",
+                    frames::MAX_FRAMES
+                ),
+            };
+            if app.last_range_err.as_ref().map(|(m, _)| m == &msg) != Some(true) {
+                push_log(app, format!("{}  {msg}", pyproc::now_hms()));
+                app.last_range_err = Some((msg, std::time::Instant::now()));
+            }
+            return;
+        }
     };
-    if (a, b) == defr {
-        app.ranges.remove(&id);
-    } else {
-        app.ranges.insert(id.clone(), (a, b));
+    ui.set_range_invalid(-1);
+
+    let cur = app.ranges.get(&id).cloned().unwrap_or_else(|| defr.clone());
+    if cur != fr {
+        if fr == defr {
+            app.ranges.remove(&id);
+        } else {
+            app.ranges.insert(id.clone(), fr.clone());
+        }
+        if let Some(j) = app.jobs.iter_mut().find(|j| j.id == id) {
+            j.frames = fr;
+            sync_jobs(app);
+        }
+        save_ranges(app);
     }
-    if let Some(j) = app.jobs.iter_mut().find(|j| j.id == id) {
-        j.fstart = a;
-        j.fend = b;
-        sync_jobs(app);
-    }
-    save_ranges(app);
-    // 生效后只刷这一行（输入框里的文字不用被模型覆盖回去）
+    // 只刷这一行的模型（勾选态/状态徽标/规范写法）。
+    // 注意：输入框一旦被用户打过字，`text: node.range` 这条绑定就被 TextInput
+    // 自己解掉了（Slint 语义：命令式赋值会移除绑定），所以格子里仍然显示用户
+    // 亲手打的那串字；规范写法（1052,1055,1056 → 1052,1055-1056）在右侧执行区
+    // 卡片上能看到，重新解析/切工程后格子里也会变成规范写法。
     if app.only_unadded {
         rebuild_nodes(ui, app);
     } else {
@@ -640,33 +742,52 @@ fn edit_range(ui: &AppWindow, app: &mut App, idx: usize, text: String) {
     }
 }
 
-fn parse_range(s: &str) -> Option<(i32, i32)> {
-    let t: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .map(|c| match c {
-            '–' | '~' | '至' => '-',
-            c => c,
-        })
-        .collect();
-    if t.is_empty() {
-        return None;
+/// 点「开始」/勾选/全选之前，把没提交的草稿先落地，
+/// 否则失焦和点击的先后顺序不可靠，会出现「改完点了开始，跑的还是旧范围」
+fn flush_draft(ui: &AppWindow, app: &mut App) {
+    if let Some((idx, text)) = app.draft.take() {
+        commit_range(ui, app, idx, text);
     }
-    if let Some((x, y)) = t.split_once('-') {
-        let a: i32 = x.parse().ok()?;
-        let b: i32 = y.parse().ok()?;
-        if b < a {
-            return None;
-        }
-        return Some((a, b));
-    }
-    let a: i32 = t.parse().ok()?;
-    Some((a, a))
 }
 
 fn save_ranges(app: &App) {
-    let json = serde_json::to_string(&app.ranges).unwrap_or_else(|_| "{}".into());
+    // 存规范写法：{"key|/obj/xxx": "1052,1055-1056,1065-1070"}
+    let map: HashMap<&str, String> = app
+        .ranges
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.label()))
+        .collect();
+    let json = serde_json::to_string(&map).unwrap_or_else(|_| "{}".into());
     app.ui_db.set_meta("ranges", &json);
+}
+
+/// 读回帧范围覆盖。老库里是 `[起, 止]` 的数组，新的是 "1052,1055-1056" 字符串，
+/// 两种都认，免得升级后用户的设置全丢
+fn load_ranges(db: &Db) -> HashMap<String, FrameSet> {
+    let mut out = HashMap::new();
+    let Some(raw) = db.get_meta("ranges") else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return out;
+    };
+    let Some(obj) = v.as_object() else {
+        return out;
+    };
+    for (k, val) in obj {
+        let fr = match val {
+            serde_json::Value::String(s) => FrameSet::parse(s).ok(),
+            serde_json::Value::Array(a) if a.len() == 2 => match (a[0].as_i64(), a[1].as_i64()) {
+                (Some(x), Some(y)) => Some(FrameSet::span(x as i32, y as i32)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(fr) = fr {
+            out.insert(k.clone(), fr);
+        }
+    }
+    out
 }
 
 // ───────────────────────── 导入 ─────────────────────────
@@ -931,37 +1052,136 @@ fn add_paths(ui: &AppWindow, app: &mut App, paths: Vec<PathBuf>) {
 
 use slint::private_unstable_api::re_exports as sk;
 
-/// 字体设置：第 0 项是「系统默认」（空串交给字体后端决定）
-const FONT_FAMILIES: &[&str] = &[
-    "",
-    "Microsoft YaHei",
-    "Microsoft YaHei UI",
-    "DengXian",
-    "SimHei",
-    "SimSun",
-    "Consolas",
-];
-/// 下拉框显示名（第 0 项不能直接显示空串）
-const FONT_FAMILY_LABELS: &[&str] = &[
-    "系统默认",
-    "微软雅黑",
-    "微软雅黑 UI",
-    "等线",
-    "黑体",
-    "宋体",
-    "Consolas",
-];
+/// 字体设置：第 0 项是「系统默认」，其余从本机枚举（见 fonts.rs），常用字体置顶。
+/// 下拉框里让用户认中文名，真正喂给 Slint 的是 `id`（族名）。
 const FONT_SIZE_LABELS: &[&str] = &["紧凑 100%", "标准 115%", "舒适 130%", "大号 145%"];
 const FONT_SCALES: &[f32] = &[1.0, 1.15, 1.3, 1.45];
 
 /// 字体落地：正文字体、等宽字体、字号倍率。所有字号在 UI 里都过 Fonts.size()。
-fn apply_fonts(ui: &AppWindow, family_idx: usize, size_idx: usize) {
+fn apply_fonts(ui: &AppWindow, fams: &[fonts::Family], family_idx: usize, size_idx: usize) {
     let g = ui.global::<Fonts>();
-    let fi = family_idx.min(FONT_FAMILIES.len() - 1);
+    let fi = family_idx.min(fams.len().saturating_sub(1));
     let si = size_idx.min(FONT_SCALES.len() - 1);
-    g.set_body(FONT_FAMILIES[fi].into());
+    let body = fams.get(fi).map(|f| f.id.as_str()).unwrap_or("");
+    g.set_body(body.into());
     g.set_mono("Consolas".into());
     g.set_scale(FONT_SCALES[si]);
+}
+
+/// 字体下拉的状态：全量列表、过滤后的可见项、以及真正生效的那一款。
+///
+/// `shown` 是「下拉下标 → 全量下标」的映射。过滤只改变下拉里显示什么，
+/// 不动 `current`，所以搜了别的词再清空，界面字体还是原来那款。
+struct FontPicker {
+    all: Vec<fonts::Family>,
+    shown: Vec<usize>,
+    current: usize,
+    filter: String,
+}
+
+impl FontPicker {
+    fn new(all: Vec<fonts::Family>) -> Self {
+        let mut p = Self {
+            all,
+            shown: Vec::new(),
+            current: 0,
+            filter: String::new(),
+        };
+        p.recompute();
+        p
+    }
+
+    /// 按过滤词重算可见项（族名和中文显示名都参与匹配，忽略大小写）
+    fn recompute(&mut self) {
+        let needle = self.filter.trim().to_lowercase();
+        self.shown = self
+            .all
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                needle.is_empty()
+                    || f.label.to_lowercase().contains(&needle)
+                    || f.id.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    /// 当前字体在下拉里的位置；被过滤掉时返回 -1（下拉显示空白，但字体不变）
+    fn cursor(&self) -> i32 {
+        self.shown
+            .iter()
+            .position(|&i| i == self.current)
+            .map(|i| i as i32)
+            .unwrap_or(-1)
+    }
+
+    /// 把可见项和选中位置推给界面。先换 model 再定 index：换 model 会让
+    /// ComboBox 把 current-index 重新 clamp 一遍，顺序反了会指到别的字体上
+    fn refresh(&self, ui: &AppWindow) {
+        let labels: Vec<slint::SharedString> = self
+            .shown
+            .iter()
+            .map(|&i| self.all[i].label.as_str().into())
+            .collect();
+        ui.set_font_families(ModelRc::new(VecModel::from(labels)));
+        ui.set_font_family_index(self.cursor());
+    }
+}
+
+/// 首次运行的默认窗口尺寸（逻辑像素）。Slint 那边不再写死，全由这里给
+const DEFAULT_WIN_SIZE: (f32, f32) = (1600.0, 820.0);
+/// 最小窗口尺寸：再小四栏就互相挤到看不清了
+const MIN_WIN_SIZE: (f32, f32) = (1180.0, 660.0);
+
+/// 上次关闭时的窗口尺寸（逻辑像素）+ 是否最大化；读不到就用默认值
+fn saved_win_size(app: &App) -> (f32, f32, bool) {
+    let read = |k: &str| app.ui_db.get_meta(k).and_then(|s| s.parse::<f32>().ok());
+    let w = read("win_w").unwrap_or(DEFAULT_WIN_SIZE.0);
+    let h = read("win_h").unwrap_or(DEFAULT_WIN_SIZE.1);
+    let max = app.ui_db.get_meta("win_max").map(|v| v == "1").unwrap_or(false);
+    (w, h, max)
+}
+
+/// 把存下来的尺寸夹进 [最小可用尺寸, 当前屏幕工作区]：
+/// 上次在 4K 上关掉、这次换 1080p 打开，不至于开出一个比屏幕还大的窗口；
+/// 反过来存了个针尖大的尺寸也不会把界面压成一团
+fn clamp_win_size(w: f32, h: f32, area_w: f32, area_h: f32) -> (f32, f32) {
+    let min_w = MIN_WIN_SIZE.0.min(area_w).max(320.0);
+    let min_h = MIN_WIN_SIZE.1.min(area_h).max(240.0);
+    (
+        w.clamp(min_w, area_w.max(min_w)),
+        h.clamp(min_h, area_h.max(min_h)),
+    )
+}
+
+/// 启动时套用上次的尺寸。超出当前显示器工作区就夹回来（上次在大屏、这次换小屏）
+fn restore_win_size(ui: &AppWindow, app: &App) {
+    let (w, h, max) = saved_win_size(app);
+    let sf = ui.window().scale_factor().max(0.5);
+    let (aw, ah) = windrop::work_area();
+    let (w, h) = clamp_win_size(w, h, aw as f32 / sf, ah as f32 / sf);
+    ui.window().set_size(slint::LogicalSize::new(w, h));
+    if max {
+        ui.window().set_maximized(true);
+    }
+}
+
+/// 把当前窗口尺寸记进 meta。物理像素按 scale-factor 折回逻辑像素再存，
+/// 换了 DPI 也不会存出一个偏大一倍的数字。
+/// 最大化时只记「最大化」标记、不覆盖宽高，这样下次取消最大化还能回到原来的尺寸。
+fn save_win_size(ui: &AppWindow, app: &App) {
+    let maxed = ui.window().is_maximized();
+    if !maxed {
+        let sf = ui.window().scale_factor().max(0.5);
+        let size = ui.window().size();
+        let (w, h) = (size.width as f32 / sf, size.height as f32 / sf);
+        if w >= 400.0 && h >= 300.0 {
+            app.ui_db.set_meta("win_w", &format!("{w:.0}"));
+            app.ui_db.set_meta("win_h", &format!("{h:.0}"));
+        }
+    }
+    app.ui_db.set_meta("win_max", if maxed { "1" } else { "0" });
 }
 
 /// 主题落地：界面 token、标准控件配色、系统标题栏三处一起切。
@@ -999,7 +1219,19 @@ fn main() -> Result<(), slint::PlatformError> {
         return Ok(());
     }
 
+    // 调试：只打印枚举到的系统字体并退出（排查「某个字体选了没反应」用）
+    if std::env::args().any(|a| a == "--list-fonts") {
+        let fams = fonts::families();
+        println!("共 {} 项（含「系统默认」）", fams.len());
+        for (i, f) in fams.iter().enumerate() {
+            println!("{i:>3}  {}  [{}]", f.label, f.id);
+        }
+        return Ok(());
+    }
+
     let ui = AppWindow::new()?;
+    // 顶栏铭牌下的版本号：单一来源是 Cargo.toml 的 version，改版本只改那一处
+    ui.set_app_version(format!("v{}", env!("CARGO_PKG_VERSION")).into());
 
     let installs = houdini::detect_installs();
 
@@ -1031,10 +1263,7 @@ fn main() -> Result<(), slint::PlatformError> {
         .into_iter()
         .map(|(s, _, _)| s)
         .collect();
-    let ranges: HashMap<String, (i32, i32)> = ui_db
-        .get_meta("ranges")
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let ranges = load_ranges(&ui_db);
 
     let (evt_tx, evt_rx) = mpsc::channel::<Event>();
     let engine = Engine::spawn(evt_tx.clone(), engine_db);
@@ -1050,6 +1279,8 @@ fn main() -> Result<(), slint::PlatformError> {
         views: Vec::new(),
         queued: HashMap::new(),
         ranges,
+        draft: None,
+        last_range_err: None,
         search: String::new(),
         filter: 0,
         only_unadded: false,
@@ -1095,6 +1326,9 @@ fn main() -> Result<(), slint::PlatformError> {
     };
     apply_theme(&ui, dark);
 
+    // 字体列表：启动时枚举一次本机系统字体（上百款），下拉框和回调共用这一份
+    let picker = Rc::new(RefCell::new(FontPicker::new(fonts::families())));
+
     // 字体设置：从库里恢复，下拉框与全局 Fonts 一起初始化
     {
         let (fi, si) = {
@@ -1105,35 +1339,72 @@ fn main() -> Result<(), slint::PlatformError> {
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(default)
             };
-            (read("font_family_index", 0), read("font_size_index", 1))
+            // 字体按族名恢复：枚举结果的条数因机器而异，存下标换了机器就会指到别的字体上。
+            // 老库只有 font_family_index，读不到族名时退回下标（随后的写回就是迁移）
+            let by_name = a.ui_db.get_meta("font_family_name").and_then(|n| {
+                picker
+                    .borrow()
+                    .all
+                    .iter()
+                    .position(|f| f.id.eq_ignore_ascii_case(&n))
+            });
+            let family = by_name.unwrap_or_else(|| read("font_family_index", 0));
+            (
+                family.min(picker.borrow().all.len() - 1),
+                read("font_size_index", 1).min(FONT_SCALES.len() - 1),
+            )
         };
-        let fam: Vec<slint::SharedString> = FONT_FAMILY_LABELS.iter().map(|s| (*s).into()).collect();
         let sizes: Vec<slint::SharedString> = FONT_SIZE_LABELS.iter().map(|s| (*s).into()).collect();
-        ui.set_font_families(ModelRc::new(VecModel::from(fam)));
         ui.set_font_size_labels(ModelRc::new(VecModel::from(sizes)));
-        ui.set_font_family_index(fi as i32);
         ui.set_font_size_index(si as i32);
-        apply_fonts(&ui, fi, si);
-        // 调试：--set-font <字体序号> <字号序号> 直接切换并落库
+        {
+            let mut p = picker.borrow_mut();
+            p.current = fi;
+            p.refresh(&ui);
+        }
+        apply_fonts(&ui, &picker.borrow().all, fi, si);
+        // 迁移：这次解析出的族名写回库，下次就不必再猜下标
+        {
+            let a = app.borrow();
+            let p = picker.borrow();
+            a.ui_db.set_meta("font_family_name", &p.all[fi].id);
+            a.ui_db.set_meta("font_family_index", &fi.to_string());
+        }
+        // 调试：--set-font <字体序号> <字号序号> 直接切换并落库（序号同 --list-fonts）
         let args: Vec<String> = std::env::args().collect();
         if let Some(pos) = args.iter().position(|a| a == "--set-font") {
+            let mut p = picker.borrow_mut();
             let nf = args
                 .get(pos + 1)
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(fi);
+                .unwrap_or(fi)
+                .min(p.all.len() - 1);
             let ns = args
                 .get(pos + 2)
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(si);
-            ui.set_font_family_index(nf as i32);
+                .unwrap_or(si)
+                .min(FONT_SCALES.len() - 1);
+            p.current = nf;
+            p.refresh(&ui);
             ui.set_font_size_index(ns as i32);
-            apply_fonts(&ui, nf, ns);
+            apply_fonts(&ui, &p.all, nf, ns);
             let a = app.borrow();
+            a.ui_db.set_meta("font_family_name", &p.all[nf].id);
             a.ui_db.set_meta("font_family_index", &nf.to_string());
             a.ui_db.set_meta("font_size_index", &ns.to_string());
         }
         if std::env::args().any(|a| a == "--font-panel") {
             ui.set_font_panel_open(true);
+        }
+        // 调试：--font-filter <词> 预置字体搜索词（验证过滤逻辑，省得手点输入框）
+        if let Some(pos) = args.iter().position(|a| a == "--font-filter") {
+            if let Some(word) = args.get(pos + 1) {
+                let mut p = picker.borrow_mut();
+                p.filter = word.clone();
+                p.recompute();
+                ui.set_font_filter(word.as_str().into());
+                p.refresh(&ui);
+            }
         }
     }
 
@@ -1263,10 +1534,22 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let app = app.clone();
         let ui_weak = ui.as_weak();
+        // 打字中：只记草稿 + 决定红框，绝不写库/重建/报错
         ui.on_range_edited(move |i, text| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let mut a = app.borrow_mut();
-            edit_range(&ui, &mut a, i as usize, text.to_string());
+            edit_range_draft(&ui, &mut a, i as usize, text.to_string());
+        });
+    }
+
+    {
+        let app = app.clone();
+        let ui_weak = ui.as_weak();
+        // 回车 / 失焦：到这里才真正解析、写库、进队列
+        ui.on_range_committed(move |i, text| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let mut a = app.borrow_mut();
+            commit_range(&ui, &mut a, i as usize, text.to_string());
             flush_log(&ui, &mut a);
         });
     }
@@ -1320,8 +1603,13 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let app = app.clone();
+        let ui_weak = ui.as_weak();
         ui.on_start_all(move || {
-            let a = app.borrow();
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let mut a = app.borrow_mut();
+            // 改了帧范围又直接点「开始」：先把草稿提交，再下发 Start
+            flush_draft(&ui, &mut a);
+            flush_log(&ui, &mut a);
             a.engine.send(Cmd::Start);
         });
     }
@@ -1486,9 +1774,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let app = app.clone();
-        ui.on_concurrency_changed(move |i| {
+        ui.on_concurrency_changed(move |n| {
             let mut a = app.borrow_mut();
-            a.concurrency = (i.max(0) as usize) + 1;
+            // 界面传的是真实并发数（不是下拉下标），1/4/6/8 这类不连续的值才对得上
+            a.concurrency = (n.max(0) as usize).max(1);
             a.engine.send(Cmd::SetConcurrency(a.concurrency));
         });
     }
@@ -1517,14 +1806,34 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let app = app.clone();
         let ui_weak = ui.as_weak();
+        let picker = picker.clone();
         ui.on_font_changed(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let fi = ui.get_font_family_index().max(0) as usize;
-            let si = ui.get_font_size_index().max(0) as usize;
-            apply_fonts(&ui, fi, si);
+            let si = (ui.get_font_size_index().max(0) as usize).min(FONT_SCALES.len() - 1);
+            let mut p = picker.borrow_mut();
+            // 下拉里没选中项（过滤后为空）时沿用原来的字体，别把界面清成默认
+            let real = usize::try_from(ui.get_font_family_index())
+                .ok()
+                .and_then(|i| p.shown.get(i).copied())
+                .unwrap_or(p.current);
+            p.current = real;
+            apply_fonts(&ui, &p.all, real, si);
             let a = app.borrow();
-            a.ui_db.set_meta("font_family_index", &fi.to_string());
+            a.ui_db.set_meta("font_family_name", &p.all[real].id);
+            a.ui_db.set_meta("font_family_index", &real.to_string());
             a.ui_db.set_meta("font_size_index", &si.to_string());
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let picker = picker.clone();
+        ui.on_font_filter_changed(move |f| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let mut p = picker.borrow_mut();
+            p.filter = f.to_string();
+            p.recompute();
+            p.refresh(&ui);
         });
     }
 
@@ -1763,9 +2072,248 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
 
+    // 窗口尺寸：恢复上次关闭时的尺寸（首次运行 = 1600x820）
+    restore_win_size(&ui, &app.borrow());
+
+    // 正常关闭时落库
+    {
+        let ui_weak = ui.as_weak();
+        let app_close = app.clone();
+        ui.window().on_close_requested(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                save_win_size(&ui, &app_close.borrow());
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    // 兜底自动保存：拖完窗口被强杀（或崩溃）也不会丢尺寸。
+    // 1 秒一轮、值变了才写库，开销可以忽略
+    let size_timer = slint::Timer::default();
+    {
+        let ui_weak = ui.as_weak();
+        let app_size = app.clone();
+        let mut last = (0u32, 0u32, false);
+        size_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(1000),
+            move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let s = ui.window().size();
+                let maxed = ui.window().is_maximized();
+                if (s.width, s.height, maxed) != last {
+                    last = (s.width, s.height, maxed);
+                    save_win_size(&ui, &app_size.borrow());
+                }
+            },
+        );
+    }
+
     // 先建窗口，好让拖放接收器拿到 HWND
     ui.show()?;
+    // 调试用：--probe-window 打印组件根元素的 layout-info。
+    // 窗口「拖不动 / 没有最大化按钮」时先看这里：min == max 就说明根元素尺寸被写死了，
+    // Slint 的 winit 后端会据此把窗口设成不可缩放（WS_THICKFRAME 都不会有）
+    if std::env::args().any(|a| a == "--probe-window") {
+        use slint::private_unstable_api::re_exports as re;
+        let inner = re::WindowInner::from_pub(&ui.window());
+        let comp = inner.component();
+        let comp = re::vtable::VRc::borrow_pin(&comp);
+        let h = comp.as_ref().layout_info(re::Orientation::Horizontal);
+        let v = comp.as_ref().layout_info(re::Orientation::Vertical);
+        eprintln!("H: {h:?}\nV: {v:?}\nsize={:?}", ui.window().size());
+    }
     let code = ui.run();
     let _ = &timer;
+    let _ = &size_timer;
     code
+}
+
+#[cfg(test)]
+mod font_picker_tests {
+    use super::*;
+
+    fn fam(id: &str, label: &str) -> fonts::Family {
+        fonts::Family {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+
+    fn picker() -> FontPicker {
+        FontPicker::new(vec![
+            fam("", "系统默认"),
+            fam("Microsoft YaHei", "微软雅黑"),
+            fam("SimSun", "宋体"),
+            fam("Noto Sans SC", "Noto Sans SC"),
+        ])
+    }
+
+    /// 过滤同时认中文显示名和英文族名，英文不分大小写
+    #[test]
+    fn filter_matches_label_and_id() {
+        let mut p = picker();
+        p.filter = "宋".into();
+        p.recompute();
+        assert_eq!(p.shown, vec![2]);
+
+        p.current = 3;
+        p.filter = "noto".into();
+        p.recompute();
+        assert_eq!(p.shown, vec![3], "英文族名应该忽略大小写匹配");
+        assert_eq!(p.cursor(), 0, "noto 只剩一项，当前字体正好是它");
+        assert_eq!(p.current, 3, "过滤不该改掉已选字体");
+    }
+
+    /// 清空过滤词要能回到完整列表，且选中项回到原位
+    #[test]
+    fn clearing_filter_restores_selection() {
+        let mut p = picker();
+        p.current = 2;
+        p.filter = "yahei".into();
+        p.recompute();
+        assert_eq!(p.cursor(), -1);
+        p.filter = String::new();
+        p.recompute();
+        assert_eq!(p.shown.len(), 4);
+        assert_eq!(p.cursor(), 2);
+    }
+
+    /// 匹配不到的过滤词给出空列表，而不是悄悄回到全量（否则用户以为过滤没生效）
+    #[test]
+    fn no_match_yields_empty_list() {
+        let mut p = picker();
+        p.filter = "zzz-no-such-font".into();
+        p.recompute();
+        assert!(p.shown.is_empty());
+        assert_eq!(p.cursor(), -1);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    /// 用户从 1001-1050 改到 1001-1060，路上必经的中间态都必须「不算错」，
+    /// 否则打字打到一半就被打断（就是踩过的坑）
+    #[test]
+    fn typing_intermediate_states_are_not_errors() {
+        for s in [
+            "1001-", "1001-1", "1001-10", "1001-106", "", "10", "1001",
+            // 不连续帧输入过程中的中间态
+            "1052,", "1052,1055,", "1052,1055,1065-", "1052,1055,1065-1070",
+            "1052，", "1052;;",
+        ] {
+            assert!(!range_draft_bad(s), "「{s}」不该在打字时标红");
+        }
+    }
+
+    /// 真不像帧范围的才立刻标红
+    #[test]
+    fn garbage_is_flagged_while_typing() {
+        for s in [
+            "1001-1a", "1.5", "abc", "1-2-3", "1001-1060帧", "1052,1065-1070-1080",
+            "1052,abc",
+        ] {
+            assert!(range_draft_bad(s), "「{s}」应该标红");
+        }
+    }
+
+    #[test]
+    fn commit_parses_full_range() {
+        assert_eq!(parse_frames("1001-1060").unwrap().label(), "1001-1060");
+        assert_eq!(parse_frames(" 1001 - 1060 ").unwrap().label(), "1001-1060");
+        assert_eq!(parse_frames("1001~1060").unwrap().label(), "1001-1060");
+        assert_eq!(parse_frames("1001–1060").unwrap().label(), "1001-1060");
+        assert_eq!(parse_frames("1050").unwrap().label(), "1050");
+    }
+
+    /// 核心需求：不连续的帧
+    #[test]
+    fn commit_parses_discrete_frames() {
+        let f = parse_frames("1052,1055,1056,1065-1070").unwrap();
+        assert_eq!(f.len(), 9);
+        assert_eq!(f.label(), "1052,1055-1056,1065-1070");
+        assert_eq!(
+            f.expand(),
+            vec![1052, 1055, 1056, 1065, 1066, 1067, 1068, 1069, 1070]
+        );
+    }
+
+    /// 没打完才提交（用户输完就点了别处）要明确报错，而不是悄悄当成 1001-106
+    #[test]
+    fn commit_rejects_half_typed_and_reversed() {
+        assert_eq!(parse_frames("1001-"), Err(FrameErr::Format));
+        assert_eq!(parse_frames("1001-106"), Err(FrameErr::Reversed(1001, 106)));
+        assert_eq!(parse_frames("1052,1070-1065"), Err(FrameErr::Reversed(1070, 1065)));
+        assert_eq!(parse_frames(""), Err(FrameErr::Format));
+        assert_eq!(parse_frames("-"), Err(FrameErr::Format));
+        assert_eq!(parse_frames("1052,"), Ok(FrameSet::single(1052)));
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    /// 取 `名字: [ ... ]` 方括号里的内容（第一次出现的位置就是声明处）
+    fn array_after<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = src.find(name).unwrap_or_else(|| panic!("ui/app.slint 里找不到 {name}"));
+        let rest = &src[at..];
+        let lb = rest.find('[').expect("选项没写在方括号里");
+        let rb = rest.find(']').expect("方括号没闭合");
+        &rest[lb + 1..rb]
+    }
+
+    /// 并发下拉的文案和真实并发值必须一一对应。
+    /// 文案是 1/2/3/4/6/8 这种不连续整数，一旦有人再拿「下标 + 1」当并发数，
+    /// 就会出现选「6」实际跑 5 的错位——而编译期完全发现不了，只能靠这条守着。
+    #[test]
+    fn concurrency_labels_match_values() {
+        let src = include_str!("../ui/app.slint");
+
+        let labels: Vec<usize> = array_after(src, "concurrency-options")
+            .split(',')
+            .filter_map(|s| s.trim().trim_matches('"').parse().ok())
+            .collect();
+        let values: Vec<usize> = array_after(src, "concurrency-values")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+
+        assert!(!values.is_empty(), "没解析到 concurrency-values");
+        assert_eq!(
+            labels, values,
+            "并发下拉的文案与真实值对不上，下拉下标不能直接当并发数用"
+        );
+    }
+}
+
+#[cfg(test)]
+mod win_size_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_normal_size() {
+        assert_eq!(clamp_win_size(1600.0, 820.0, 2560.0, 1408.0), (1600.0, 820.0));
+    }
+
+    #[test]
+    fn clamps_tiny_size_up_to_minimum() {
+        let (w, h) = clamp_win_size(200.0, 120.0, 2560.0, 1408.0);
+        assert_eq!((w, h), MIN_WIN_SIZE);
+    }
+
+    #[test]
+    fn clamps_huge_size_to_work_area() {
+        // 上次在 4K 上关掉、这次 1080p 打开：不能开出比屏幕还大的窗口
+        let (w, h) = clamp_win_size(3800.0, 2100.0, 1920.0, 1040.0);
+        assert_eq!((w, h), (1920.0, 1040.0));
+    }
+
+    #[test]
+    fn screen_smaller_than_minimum_does_not_invert() {
+        // 极小屏（比如远程桌面）上工作区比最小尺寸还小，也不能让 clamp 反过来变成
+        // 「下限 > 上限」而 panic
+        let (w, h) = clamp_win_size(1600.0, 820.0, 800.0, 600.0);
+        assert!(w >= 320.0 && h >= 240.0, "{w}x{h} 不该小于硬下限");
+    }
 }

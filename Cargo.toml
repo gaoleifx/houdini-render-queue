@@ -1,9 +1,10 @@
 [package]
 name = "houdini-render-queue"
-version = "0.1.0"
+version = "2026.2.0"
 edition = "2024"
 
 [dependencies]
+fontdb = "0.24"
 raw-window-handle = "0.6"
 rfd = "0.18.0"
 rusqlite = { version = "0.43.0", features = ["bundled"] }

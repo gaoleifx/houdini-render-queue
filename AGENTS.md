@@ -16,7 +16,7 @@
 关键定位判断（改需求时先想清这三条）：
 
 - **执行者是 hython 子进程**，Rust 只做调度、进度汇总和界面。所有 Houdini 相关知识都在 `python/` 里。
-- **一次任务 = 一个节点 + 一段帧范围**，任务 ID 由 `工程 key` + `节点路径` 拼成，天然幂等。
+- **一次任务 = 一个节点 + 一个帧集合**（连续区间或不连续帧，如 `1052,1055,1065-1070`），任务 ID 由 `工程 key` + `节点路径` 拼成，天然幂等。
 - **状态必须能跨重启恢复**：SQLite 记工程、任务、已完成帧，重开程序队列还在。
 
 ---
@@ -38,17 +38,19 @@
 ## 3. 目录地图
 
 ```
-src/main.rs      1771 行，界面状态与所有回调（App 结构体、工程列表、节点表、队列同步）
-src/queue.rs      665 行，调度引擎：线程 + mpsc 指令通道 + 并发/重试/断点/取消
-src/db.rs         359 行，SQLite：projects / jobs / frames / meta 四张表
-src/model.rs      263 行，领域模型：Category、JobStatus、NodeInfo、Project、JobSpec、JobView、Event
+src/main.rs      2145 行，界面状态与所有回调（App 结构体、工程列表、节点表、队列同步）
+src/queue.rs      667 行，调度引擎：线程 + mpsc 指令通道 + 并发/重试/断点/取消
+src/db.rs         376 行，SQLite：projects / jobs / frames / meta 四张表
+src/frames.rs     282 行，帧集合 FrameSet：解析 `1052,1055,1065-1070`、合并相邻段、展开成逐帧列表
+src/model.rs      259 行，领域模型：Category、JobStatus、NodeInfo、Project、JobSpec、JobView、Event
 src/analyze.rs    152 行，起 hython 跑 analyze.py，截取 JSON，带超时
 src/houdini.rs    154 行，扫安装目录找 hython；读 hip 头部 `_HIP_SAVEVERSION` 得到制作版本
 src/windrop.rs    724 行，OLE 拖放 + 窗口子类化（双击 / 大图标）
 src/pyproc.rs      55 行，脚本路径定位 + 隐藏窗口的 Command
 src/snap.rs        43 行，`--snapshot` 截图（调试用）
+src/fonts.rs      约 150 行，枚举本机系统字体（fontdb），给字体设置下拉框用
 
-ui/app.slint     1324 行，全部界面：顶栏 / 三栏（工程、节点、队列）/ 日志列 / 底部状态栏
+ui/app.slint     1369 行，全部界面：顶栏 / 三栏（工程、节点、队列）/ 日志列 / 底部状态栏
 python/analyze.py 255 行，在 hython 里枚举输出节点 → JSON
 python/render.py  266 行，在 hython 里按帧渲染 → `##` 标记行
 
@@ -96,9 +98,13 @@ dist/            可分发产物（exe + python/），改完要手动同步
 ### 4.3 持久化
 
 - `projects`：key / hip / shot / houdini / hython / nodes_json / gstart / gend / pinned
-- `jobs`：任务快照（含 ord 顺序、status、attempts）
-- `frames`：已完成帧，`(job_id, frame)` 主键
-- `meta`：字体、主题等 UI 偏好
+- `jobs`：任务快照（含 ord 顺序、status、attempts）。`fstart`/`fend` 存帧集合的**上下界**，
+  真正的帧集合在 `frames` 列（规范写法，如 `1052,1055-1056,1065-1070`）；老库该列为空串，
+  读的时候退回 `fstart..fend` 当连续区间
+- `frames`：已完成帧，`(job_id, frame)` 主键。不连续帧也只是行数不同，无需特殊处理
+- `meta`：字体、主题、窗口尺寸（`win_w` / `win_h` 逻辑像素、`win_max` 是否最大化）、
+  `ranges`（帧范围覆盖，`{job_id: "1052,1055-1056"}`；
+  老版本是 `[起, 止]` 数组，`load_ranges()` 两种都认）
 
 启动时读库重建队列；上次退出时处于 `running` 的任务会回落到 `queued`（进程已经没了）。
 
@@ -118,6 +124,9 @@ dist/            可分发产物（exe + python/），改完要手动同步
   "nodes": [{"path","type","category","output","output_parm","fstart","fend","frame_source"}] }
 <<<ANALYZE_JSON_END>>>
 ```
+
+帧计划 `plan.json` 是 `{"frames": [1052,1055,1065,1066]}` —— **逐帧列表**，
+所以不连续帧在 Python 侧不需要任何改动（`frames[0]` 只用于预检探路）。
 
 `render.py` 输出标记（Rust 在 `queue.rs` 的 `run_worker` 里解析）：
 
@@ -153,6 +162,19 @@ Slint 1.19 的坑（都在这里踩过，改 UI 前必读）：
 3. 组件体里**不能写** `Global.callback => {}` 或 `changed Global.prop`（解析器不支持）——全局里放 `in-out property` 当信号，组件用 `private property` 转一手再 `changed`。
 4. `ScrollView` 的滚动位置是 `content-y`（`viewport-y` 已废弃）；`ListView` 用 `visible-width`（`viewport-width` 是内容宽度，别用）。
 5. 卡片高度别写死：`Math.max(46px, lay.preferred-height)` + `clip: true`，否则字号放大到 115%/145% 会文字溢出压到下一张卡。
+6. **`Window` 上不要写 `width` / `height`**：写了会让组件根元素的 layout-info 变成 `min == max`（实测 1600/1600），
+   Slint 的 winit 后端据此判定「窗口不可缩放」，直接摘掉 `WS_THICKFRAME` 和最大化按钮——表现就是拖不动、也没有最大化。
+   初始尺寸由 Rust 侧 `window().set_size()` 给（见 `restore_win_size`），`ui/app.slint` 里最多写 `min-height`。
+7. **根内容元素写 `width: root.width` 同样会钉死窗口**：整个界面铺满窗口要交给布局（`horizontal-stretch: 1` / `100%`），
+   任何 `root.width - Npx` 的派生宽度都会把 min/max 算成同一个值。
+8. 四栏（工程 / 节点表 / 队列 / 日志）的宽度用 `min-width` + `preferred-width` + `max-width` + `horizontal-stretch` 表达，
+   中栏必须显式写 `max-width: 100000px`：不写时 Slint 把它的 max 当成和 min 一样大，窗口最宽只能到「几栏 max 之和」。
+9. `ScrollView` 里的内容宽度绑**面板**宽度（`left-body.width - 18px`），不要绑 `visible-width` 或 `root.width`
+   ——前者和 ScrollView 的 preferred-width 互相依赖，后者会把窗口尺寸钉死。
+
+窗口尺寸记忆：`meta` 里 `win_w` / `win_h`（逻辑像素，物理像素按 scale-factor 折回）+ `win_max`。
+`on_close_requested` 落库一次，另有 1s 轮询兜底（被强杀也不丢）；启动 `restore_win_size()` 读回来并夹进当前屏幕工作区
+（`windrop::work_area()`），换显示器不会开出比屏幕还大的窗口。最大化时只记 `win_max`、不覆盖宽高。
 
 ---
 
@@ -163,8 +185,13 @@ cargo build              # debug，保留控制台方便看 eprintln!
 cargo build --release    # 产物 target/release/houdini-render-queue.exe
 ```
 
+- **分发包必须自包含**：`.cargo/config.toml` 给 `x86_64-pc-windows-msvc` 加了 `-C target-feature=+crt-static`，
+  产物不依赖 `VCRUNTIME140.dll` / VC++ 运行库，**别删**（删了就会出现「我这儿能跑、别人电脑打不开」）。
 - 运行需要 exe 同级有 `python/`（`pyproc::script_path` 按 `exe/python/` → `../../python/` → `./python/` 顺序找）。
+  脚本**不**编进 exe，分发时 exe 与 `python/` 必须一起拷。
 - 分发：改完 exe 与 python 都要复制到 `dist/`，以及运行实例目录 `C:\BatchRender\houdini-render-queue\`（**被占用时需先关程序**）。
+- **出包是验证的固定收尾动作**：每次改完并验证通过，就 `cargo build --release` 并把 exe 同步到 `dist/` 和实例目录，不用等用户提。
+  只改 Rust/Slint 时只需拷 exe（界面已编进 exe）；`python/` 有改动才一起同步。拷贝前先 `tasklist | grep houdini-render` 确认没有实例在跑。
 
 调试开关（`main.rs` 里解析）：
 
@@ -173,8 +200,17 @@ cargo build --release    # 产物 target/release/houdini-render-queue.exe
 --snapshot <file.bmp> [--snapshot-delay <ms>]     抓主窗口截图，写 BMP
 --light / --set-font <字体> <字号> / --set-version <下标>
 --probe-version <hip> / --font-panel
+--font-filter <词>                                 预置字体搜索词，验证过滤
+--probe-window                                     打印根元素 layout-info（窗口拖不动时先看 min 是否等于 max）
+--list-fonts                                       打印枚举到的系统字体（带序号）后退出
 --debug-invoke clear-finished|restart-all          直接触发回调，做回归
 ```
+
+字体这块的两个坑（`src/fonts.rs`）：枚举用 `fontdb`（Slint 内部查字体用的同一个库），
+不要换回 GDI 的 `EnumFontFamiliesExW`——它报的是 face name，会把 `Bahnschrift Light`
+这类字重变体全列出来、还漏中文族名，喂给 Slint 一半匹配不上；`meta` 里存的是族名
+`font_family_name`（不是下标，枚举条数换机器就变），老库的 `font_family_index` 只在读不到
+族名时兜底并顺手迁移。
 
 自测三板斧：
 
@@ -192,10 +228,20 @@ cargo build --release    # 产物 target/release/houdini-render-queue.exe
 4. **空缓存要报失败**：所有帧输出都 <1KB 时 `##FAIL`，不能静默报完成。
 5. **SOP 缓存节点没有 `render()`**：要临时建一个 `/out` 下的 `geometry` ROP 当代理，帧号从展开路径还原成 `$F4` 模板。
 6. **`hou.setUpdateMode(Manual)` 下 `node.geometry()` 不触发 cook**，探针会得到 0 点。探上游用 AutoUpdate。
-7. **从 git bash 起 hython 时 `HOME` 不对**，pref dir 会跑偏导致 packages（Axiom 等）不加载、`hipFile.load` 直接抛异常。手动探生产 hip 要带 `HOUDINI_USER_PREF_DIR=C:/Users/Gaole/Documents/houdini21.0`。
+7. **`HOME` 指到用户主目录 = 所有 package 静默失效**（这是「解析失败」最常见的原因）。hython 拿 `HOME` 当 Houdini 家目录：`HOME=C:\Users\<name>` 时 pref dir 解析成 `C:\Users\<name>\houdini21.0`，`Documents\houdini21.0\packages` 一个都不加载，用到 `axiom_solver_core::3.3` 的 hip 直接 `Bad node type found`。GUI 的 `houdini.exe` 自己会把 `HOME` 改成 `%USERPROFILE%\Documents`，所以只有我们起的子进程会中招。现在 `pyproc::hidden()` 里的 `align_home_env()` 会在 `HOME == %USERPROFILE%` 且没显式 `HOUDINI_USER_PREF_DIR` 时把 `HOME` 摘掉，对齐 GUI 行为；**别删这段**。从 git bash 手动探生产 hip 仍要带 `HOUDINI_USER_PREF_DIR=C:/Users/Gaole/Documents/houdini21.0`（bash 的 `HOME=/c/Users/Gaole` 同样会踩）。排查手法：`hython -c "import hou;print(hou.getenv('HOUDINI_USER_PREF_DIR'))"` 看 pref dir 落在哪。
 8. **状态字符串中英双写**：库和快照里 `status` 可能存 `success` 也可能存 `成功`，`JobStatus::parse` 两者都认。新增状态别忘了同步。
 9. **引擎主循环用 `recv_timeout(120ms)` + `pending_cmd`**，不要改回 `sleep`，否则勾选/删除要干等一轮。
 10. **`cargo:rustc-link-arg` 不能带引号**，路径有空格时先把 `.res` 复制到无空格目录。
+11. **帧范围输入框：`edited` 只记草稿，`committed` 才提交**。`TextInput.edited` 每敲一个字符都会触发，把 `1001-1050` 改成 `1001-1060` 的路上必然经过 `1001-`、`1001-106` 这种非法中间态（结束帧还没打完 / 比起始帧小）。把校验、写库、`sync_jobs`、报错全塞进 `edited` 的结果就是用户被自己的中间态反复打断、输入框被 `rebuild_nodes` 覆盖。现在的分工是：`edited` → `edit_range_draft`（只存取草稿 + 决定 `range-invalid` 红框），`committed`（回车 + 失焦）→ `commit_range`（解析、写库、进队列）。点「开始」「全选」等入口前先调 `flush_draft`，因为失焦和点击的先后顺序不可靠。**别再往 `edited` 里加任何写操作。**
+12. **帧数是集合的帧数，不是 `fend - fstart + 1`**。`JobSpec.frames`（`src/frames.rs` 的 `FrameSet`）是唯一真源：
+    `1052,1055,1056,1065-1070` 是 9 帧，而上下界 1052–1070 是 19 帧。进度、`plan.json`、断点续渲全部走
+    `FrameSet::len()/expand()/count_done()`；`fstart`/`fend` 只用来拼显示文本和兼容老库。
+    单个任务上限 `MAX_FRAMES = 100_000`，防止手滑 `1-99999999` 把内存撑爆。
+13. **输入框不会自动回显「规范写法」**。用户一旦在 `TextInput` 里打过字，`text: node.range` 这条绑定就被
+    Slint 解掉了（命令式赋值会移除绑定），所以 `commit_range` 里 `refresh_row` 改的是行模型，格子里仍然是
+    用户亲手打的那串字。规范写法（相邻帧并成区间）在右侧执行区卡片上看，重新解析 / 切工程后格子也会更新。
+14. **`devtest/hou.py` 必须与 `render.py` 用到的 hou API 同步**。`render.py` 会 `isinstance(node, hou.SopNode)`，
+    假 hou 里缺这个类就直接 AttributeError 打断整轮渲染——补 `SopNode` 子类才能跑通端到端回归。
 
 ---
 

@@ -45,6 +45,9 @@ class Parm:
     def evalAsString(self):
         return str(self.v)
 
+    def set(self, v):
+        self.v = v
+
 
 class NodeType:
     def __init__(self, n):
@@ -89,6 +92,10 @@ class Node:
         time.sleep(0.08)
 
 
+class SopNode(Node):
+    """SOP 节点：render.py 会 isinstance(node, hou.SopNode) 判断要不要关 Load From Disk"""
+
+
 def _build():
     geo = Node("/out/geo_cache", "rop_geometry",
                {"sopoutput": "$HIP/geo/cache.$F4.bgeo.sc", "f1": 1, "f2": 12})
@@ -103,8 +110,8 @@ def _build():
     obj_geo = Node("/obj/efx_geo", "geo", {}, [
         Node("/obj/efx_geo/abc_import", "alembic",
              {"filename": "$HIP/geo/abc.$F4.abc"}),
-        Node("/obj/efx_geo/cache_out", "filecache::2.0",
-             {"sopoutput": "$HIP/geo/efx.$F4.bgeo.sc", "f1": 1, "f2": 8}),
+        SopNode("/obj/efx_geo/cache_out", "filecache::2.0",
+                {"sopoutput": "$HIP/geo/efx.$F4.bgeo.sc", "f1": 1, "f2": 8}),
     ])
     return {
         "/out": Node("/out", "root", {}, [geo, abc, ifd, misc]),

@@ -373,9 +373,16 @@ component Field inherits Rectangle {
     in property <length> w: 120px;
     in property <length> h: 21px;
     in property <bool> centered: false;
+    /// 内容还不合法：只把描边染红，绝不改写输入框里的文字，也不打断输入
+    in property <bool> invalid: false;
+    /// 每次文本变化都会触发（打字过程中用，别在这里做校验/写库）
     callback edited(string);
+    /// 回车或失焦才触发：只有这里的结果才允许写回模型
+    callback committed(string);
     /// 转发 FieldActions.tick，才能用 changed 监听（Slint 的 changed 只认裸标识符）
     private property <int> dbl-tick: FieldActions.tick;
+    /// 单独提一手，才能在组件体里 changed（不能直接 changed ti.has-focus）
+    private property <bool> focused: ti.has-focus;
     width: w;
     height: h;
     border-radius: 5px;
@@ -383,7 +390,8 @@ component Field inherits Rectangle {
     background: ti.has-focus ? Theme.well-focus : Theme.well;
     animate background { duration: 110ms; easing: ease-out; }
     border-width: 1px;
-    border-color: ti.has-focus ? Theme.accent : Theme.border;
+    // 不合法优先染红，其次才是聚焦态
+    border-color: root.invalid ? Theme.err : (ti.has-focus ? Theme.accent : Theme.border);
     // 双击整段选中：只有被双击命中、且正在编辑的那一格才动，别的格不响应
     changed dbl-tick => {
         if (ti.has-focus
@@ -392,6 +400,12 @@ component Field inherits Rectangle {
             && FieldActions.y * 1px >= self.absolute-position.y
             && FieldActions.y * 1px <= self.absolute-position.y + self.height) {
             ti.select-all();
+        }
+    }
+    // 失焦即提交：原来不提交的话，用户改完直接点「开始」会用到旧值
+    changed focused => {
+        if (!root.focused) {
+            root.committed(ti.text);
         }
     }
     // TextInput 没有 placeholder 属性，用一层文字兜底
@@ -423,6 +437,8 @@ component Field inherits Rectangle {
         text <=> root.text;
         single-line: true;
         edited => { root.edited(self.text); }
+        // 回车提交；失焦走上面的 changed focused
+        accepted => { root.committed(self.text); }
     }
 }
 
@@ -490,8 +506,12 @@ export component AppWindow inherits Window {
     title: "Houdini 渲染队列";
     // 标题栏 / 任务栏图标：与 exe 内嵌图标（assets/app.ico）同一套设计
     icon: @image-url("../assets/app.png");
-    width: 1600px;
-    height: 820px;
+    // 注意：这里**不要**写 width / height。在 Window 上写死初始尺寸会让组件的
+    // layout-info 变成 min == max（实测 min=1600 max=1600），winit 后端据此把窗口
+    // 设成不可缩放（没有 WS_THICKFRAME、没有最大化按钮）。
+    // 初始尺寸改由 Rust 侧 set_size（默认 1600x820，优先用上次关闭时的尺寸）。
+    // min-height 兜住下限：再矮下去四栏就被压成一条缝（只约束 min，不影响可缩放）
+    min-height: 640px;
     background: Theme.canvas;
     // 统一字体入口：未单独指定字体的文字都继承这里
     default-font-family: Fonts.body;
@@ -503,13 +523,22 @@ export component AppWindow inherits Window {
     in-out property <int> font-size-index: 1;
     in-out property <bool> font-panel-open: false;
     callback font-changed();
+    /// 字体下拉的过滤词（本机上百款字体，靠下拉翻太费劲）
+    in-out property <string> font-filter: "";
+    callback font-filter-changed(string);
+
+    /// 本软件自身的版本号（运行时由 Rust 侧按 CARGO_PKG_VERSION 填，形如 v0.1.0）
+    in property <string> app-version: "v0.0.0";
 
     /// 当前工程的版本是否被手动锁定
     in property <bool> version-pinned: false;
     /// 当前工程可选/已选的 Houdini 版本：第 0 项是「自动」，其余为本机安装
     in property <[string]> version-options;
     in-out property <int> version-index: 0;
+    /// 显示文案与真实值分开：1/2/3/4/6/8 不是连续整数，不能拿下标当并发数
+    /// （曾经用 index+1 换算，选「6」实际只跑 5、选「8」实际跑 6）
     in property <[string]> concurrency-options: ["1", "2", "3", "4", "6", "8"];
+    in property <[int]> concurrency-values: [1, 2, 3, 4, 6, 8];
     in-out property <int> concurrency-index: 0;
     in property <[string]> retry-options: ["不重试", "1 次", "2 次", "3 次"];
     in-out property <int> retry-index: 2;
@@ -535,10 +564,10 @@ export component AppWindow inherits Window {
     /// 「重新开始」已进入待确认状态：4 秒内再点一次才真正重跑整批
     in-out property <bool> restart-armed: false;
     in property <string> node-empty-hint;
+    /// 帧范围输入框里不合法的那一行（-1 = 没有）：只影响描边颜色，不改数据
+    in-out property <int> range-invalid: -1;
     /// 有文件正悬停在窗口上（由 Rust 侧 OLE DragEnter/DragLeave 驱动）
     in-out property <bool> drag-hover: false;
-    /// 最右侧日志列宽度
-    property <length> log-col-width: 360px;
 
     // 日志跟随：有新日志时把日志视图贴到最底部（超出范围由 Flickable 自行夹紧）
     changed log-text => {
@@ -569,6 +598,8 @@ export component AppWindow inherits Window {
     callback remove-project(int);
     callback toggle-node(int);
     callback range-edited(int, string);
+    /// 回车 / 失焦提交帧范围，只有这里的结果才写回模型
+    callback range-committed(int, string);
     callback search-changed(string);
     callback filter-changed(int);
     callback toggle-unadded();
@@ -589,16 +620,15 @@ export component AppWindow inherits Window {
     callback toggle-theme();
 
 
+    // 根内容铺满窗口。这里**不能**写 width: root.width / height: root.height：
+    // 根元素的 layout-info 会因此得到 min == max == 当前窗口尺寸，winit 后端据此判定
+    // 「窗口不可缩放」并把 WS_THICKFRAME / WS_MAXIMIZEBOX 全摘掉（用户看到的就是拖不动、没有最大化）。
+    // 不给尺寸：Window 的第一层子元素天生铺满窗口，下面全靠布局的 stretch 分配空间。
+    // （同理，里面任何 `root.width - Npx` 的派生宽度也会把窗口钉死，一律改成 stretch）
     Rectangle {
-        x: 0;
-        y: 0;
-        width: root.width;
-        height: root.height;
         background: transparent;
 
         VerticalLayout {
-            width: root.width;
-            height: root.height;
             padding-top: 11px;
             padding-bottom: 11px;
             padding-left: 13px;
@@ -607,7 +637,7 @@ export component AppWindow inherits Window {
 
             // ── 顶栏 ──
             Rectangle {
-                width: root.width - 26px;
+                horizontal-stretch: 1;
                 height: 40px;
                 VerticalLayout {
                     alignment: center;
@@ -643,7 +673,11 @@ export component AppWindow inherits Window {
                                 color: Theme.text;
                                 vertical-alignment: center;
                             }
-                            Tag { text: "LOCAL · 本机后台"; }
+                            // 铭牌下方一行小字：直接显示当前软件版本号（替代原来的「LOCAL · 本机后台」）
+                            Tag {
+                                text: root.app-version;
+                                letter-spacing: 0.2px;
+                            }
                         }
 
                         // 运行状态：一盏小灯 + 一句描述，一眼看清队列在干什么。
@@ -677,7 +711,7 @@ export component AppWindow inherits Window {
                             w: 64px;
                             options: root.concurrency-options;
                             index <=> root.concurrency-index;
-                            picked(v) => { root.concurrency-changed(root.concurrency-index); }
+                            picked(v) => { root.concurrency-changed(root.concurrency-values[v]); }
                         }
                         // 两组参数之间留一道呼吸缝，免得「并发 1 重试 2 次」读成一串
                         Rectangle { width: 8px; height: 1px; }
@@ -695,7 +729,9 @@ export component AppWindow inherits Window {
                         TBtn { label: "取消"; kind: 3; w: 64px; clicked => { root.cancel-all(); } }
                         VRule { }
                         // 外观
-                        TBtn { label: "字体"; w: 46px; clicked => { root.font-panel-open = true; } }
+                        // 与「开始 / 暂停 / 取消」同宽：46px 时两字几乎顶到边框，留白比隔壁按钮
+                        // 小一大截，看着像字号不一样。统一 64px 后整排按钮的呼吸感才一致
+                        TBtn { label: "字体"; w: 64px; clicked => { root.font-panel-open = true; } }
                         Rectangle { width: 4px; height: 1px; }
                         ThemeSwitch {
                             on: Theme.dark;
@@ -705,16 +741,21 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // ── 三栏 ──
+            // ── 四栏 ──
+            // 宽度一律交给布局：min 兜住不塌，preferred 是常规窗口下的理想宽度，
+            // max 防止拉太宽后某一栏空出一大片；horizontal-stretch 决定多余空间怎么分
+            // （中栏节点表吃最多，队列卡和日志各分一点）
             HorizontalLayout {
-                width: root.width - 26px;
+                horizontal-stretch: 1;
                 vertical-stretch: 1;
                 spacing: 9px;
 
                 // 左：工程
                 Panel {
-                    width: 202px;
-                    VerticalLayout {
+                    min-width: 190px;
+                    preferred-width: 202px;
+                    max-width: 250px;
+                    left-body := VerticalLayout {
                         padding-top: 9px;
                         padding-bottom: 9px;
                         padding-left: 9px;
@@ -730,7 +771,10 @@ export component AppWindow inherits Window {
                         Rule { }
                         shots-sv := ScrollView {
                             VerticalLayout {
-                                width: 184px;
+                                // 宽度绑面板内宽（不是 root 也不是 ScrollView 自己），
+                                // 面板一缩放卡片就跟着走，且不会和 ScrollView 的
+                                // preferred-width 形成互相依赖
+                                width: left-body.width - 18px;
                                 spacing: 2px;
                                 for shot[i] in root.shots: card := Rectangle {
                                     // hover 判定要把删除按钮自己算进去，否则鼠标移到 × 上会闪
@@ -823,9 +867,13 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // 中：输出节点（宽度 = 窗口 - 左右边距 - 左栏 - 右栏 - 日志列 - 3 个间距）
+                // 中：输出节点（吃掉窗口多余宽度，表里 path 列最需要横向空间）
                 Panel {
-                    width: root.width - 26px - 202px - 298px - root.log-col-width - 27px;
+                    min-width: 440px;
+                    // 必须显式给上限：不写的话 Slint 把它当成和 min 一样大，
+                    // 整个窗口的最大宽度就被钉在「几栏 max 之和」上，拖不宽
+                    max-width: 100000px;
+                    horizontal-stretch: 1;
                     VerticalLayout {
                         padding-top: 9px;
                         padding-bottom: 9px;
@@ -964,9 +1012,14 @@ export component AppWindow inherits Window {
                                             Field {
                                                 w: 100px;
                                                 h: 20px;
-                                                centered: true;
+                                                // 不连续帧会长到 1052,1055-1056,1065-1070，
+                                                // 居中会让两头同时被裁，改成左对齐
+                                                centered: false;
                                                 text: node.range;
+                                                // 非法只标红这一格，不碰行模型、不打断输入
+                                                invalid: root.range-invalid == i;
                                                 edited(t) => { root.range-edited(i, t); }
+                                                committed(t) => { root.range-committed(i, t); }
                                             }
                                         }
                                         VerticalLayout {
@@ -995,8 +1048,11 @@ export component AppWindow inherits Window {
 
                 // 右：执行区
                 Panel {
-                    width: 298px;
-                    VerticalLayout {
+                    min-width: 262px;
+                    preferred-width: 298px;
+                    max-width: 380px;
+                    horizontal-stretch: 0.2;
+                    q-body := VerticalLayout {
                         padding-top: 9px;
                         padding-bottom: 9px;
                         padding-left: 9px;
@@ -1030,7 +1086,7 @@ export component AppWindow inherits Window {
                         Rule { }
                         queue-sv := ScrollView {
                             VerticalLayout {
-                                width: 280px;
+                                width: q-body.width - 18px;
                                 spacing: 5px;
                                 for t[i] in root.queue: Rectangle {
                                     // 同左栏：高度跟内容走，大字号下不会压到下一张卡片
@@ -1104,8 +1160,11 @@ export component AppWindow inherits Window {
 
                 // 最右：日志（独立一列）
                 Panel {
-                    width: root.log-col-width;
-                    VerticalLayout {
+                    min-width: 280px;
+                    preferred-width: 360px;
+                    max-width: 620px;
+                    horizontal-stretch: 0.5;
+                    log-body := VerticalLayout {
                         padding-top: 9px;
                         padding-bottom: 9px;
                         padding-left: 9px;
@@ -1123,15 +1182,22 @@ export component AppWindow inherits Window {
                             vertical-stretch: 1;
                             background: Theme.dark ? #0c0e11 : #fbfaf8;
                             log-sv := ScrollView {
+                                // 宽度必须钉在面板上：ScrollView 不写 width 会按「内容理想宽度」撑开，
+                                // 日志里一出现超长行（长路径 / 整段 hython 报错）就把视口撑到 500+px，
+                                // 里面写死宽度的布局再被居中 → 整块文字右移、右半边被裁掉
+                                width: parent.width;
+                                height: parent.height;
                                 VerticalLayout {
-                                    width: root.log-col-width - 20px;
+                                    width: log-body.width - 20px;
                                     padding-top: 7px;
                                     padding-bottom: 7px;
                                     padding-left: 11px;
                                     padding-right: 11px;
                                     alignment: start;
                                     Text {
-                                        width: 100%;
+                                        // 宽度必须是明确长度：写 100% 时 Text 的理想宽度仍按最长的
+                                        // 不可断词算，会把 ScrollView 内容撑到 430+，布局再被居中右移
+                                        width: log-body.width - 42px;
                                         text: root.log-text;
                                         font-size: Fonts.size(10.5px);
                                         color: Theme.dark ? #a8a49b : #55534e;
@@ -1149,7 +1215,7 @@ export component AppWindow inherits Window {
 
             // ── 底部状态栏 ──
             Rectangle {
-                width: root.width - 26px;
+                horizontal-stretch: 1;
                 height: 24px;
                 border-radius: 6px;
                 background: Theme.panel;
@@ -1240,9 +1306,9 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 x: (parent.width - 500px) / 2;
-                y: (parent.height - 306px) / 2;
+                y: (parent.height - 372px) / 2;
                 width: 500px;
-                height: 322px;
+                height: 372px;
                 border-radius: 12px;
                 background: Theme.panel;
                 border-width: 1px;
@@ -1259,11 +1325,23 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 12px;
                         Tag { text: "界面字体"; width: 76px; }
-                        ComboBox {
+                        fam-box := ComboBox {
                             model: root.font-families;
                             current-index <=> root.font-family-index;
                             horizontal-stretch: 1;
                             selected(v) => { root.font-changed(); }
+                        }
+                    }
+                    // 搜索框与上面的下拉同宽，输入即过滤（只筛下拉，不写库、不改当前字体）
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Rectangle { width: 76px; height: 1px; }
+                        Field {
+                            w: fam-box.width;
+                            h: 30px;
+                            placeholder: "搜索字体：宋体 / Noto / Consolas";
+                            text <=> root.font-filter;
+                            edited(t) => { root.font-filter-changed(t); }
                         }
                     }
                     HorizontalLayout {
@@ -1309,6 +1387,9 @@ export component AppWindow inherits Window {
                             label: "恢复默认";
                             w: 84px;
                             clicked => {
+                                // 先清过滤词：否则下拉里可能没有「系统默认」这一项，index=0 会落到别的字体上
+                                root.font-filter = "";
+                                root.font-filter-changed("");
                                 root.font-family-index = 0;
                                 root.font-size-index = 1;
                                 root.font-changed();

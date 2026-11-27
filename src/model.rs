@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::frames::FrameSet;
+
 // ───────────────────────── 分类 ─────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -206,17 +208,11 @@ pub struct JobSpec {
     pub node_type: String,
     pub category: Category,
     pub output: String,
-    pub fstart: i32,
-    pub fend: i32,
+    /// 本任务要跑的帧集合：连续区间与不连续帧都行（1052,1055,1065-1070）
+    pub frames: FrameSet,
 }
 
 impl JobSpec {
-    pub fn frames(&self) -> Vec<i32> {
-        if self.fend < self.fstart {
-            return vec![self.fstart];
-        }
-        (self.fstart..=self.fend).collect()
-    }
     pub fn title(&self) -> String {
         self.node_path
             .rsplit('/')
